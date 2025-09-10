@@ -6,73 +6,115 @@ from astropy.io import fits
 import astropy.constants as const
 from utils import *
 from scipy.interpolate import interp1d
+import pathlib
+from astropy.table import QTable
 
 class CrossCorr:
 
-    def __init__(self, system_obj, planet_wl_obs_range, transit_flux_array, transit_errors_array, plot=False):
+    def __init__(self, system_obj, wave, flux, err, outlier_sigma=3, 
+                 systrem_iter=3, plot_order=None, template=None):
 
         inherit_attributes = ['data_path','delta_lambda','phase_obs','in_transit',
-                              'planet_wl_um','Kp','rv_transit','phase_transit']
+                              'planet_wl_um','Kp','rv_transit','phase_transit',
+                              'planet_wl_obs_range']
 
         for attr in inherit_attributes:  # list of attributes to pass down
             setattr(self, attr, getattr(system_obj, attr))
 
-        num_exp = len(transit_flux_array)
+        num_exp, num_orders, num_wave  = flux.shape
 
-        def remove_continuum(wave, spec, err, poly_order=3, get_cont=False):
-            wave = np.asarray(wave.value if isinstance(wave, u.Quantity) else wave)
-            spec = np.asarray(spec.value if isinstance(spec, u.Quantity) else spec)
-            err = np.asarray(err.value if isinstance(err, u.Quantity) else err)
-            spec_2d = np.atleast_2d(spec)
-            err_2d = np.atleast_2d(err)
+        def mask_absorption_emission(spec,specerr,lowerlim=0.7,upperlim=1.2):
+            flux_out = np.copy(spec)
+            fluxerr_out=np.copy(specerr)
+            for exp in range(num_exp):
+                for order in range(num_orders):
+                    fl=flux_out[exp,order]
+                    flerr=fluxerr_out[exp,order]
+                    flux_norm = fl/np.nanmedian(fl) #normalized spectrum
+                    goodpix = ((flux_norm>lowerlim)&(flux_norm<upperlim))
+                    flux_out[exp,order][~goodpix] = np.nan
+                    fluxerr_out[exp,order][~goodpix] = np.inf            
+            return flux_out,fluxerr_out
 
-            flux_contrem, err_contrem, continua = [], [], []
-            for s,e in zip(spec_2d,err_2d):
-                continuum = np.poly1d(np.polyfit(wave, s, poly_order))(wave)
-                continua.append(continuum)
-                flux_contrem.append(s / continuum)
-                err_contrem.append(e / continuum)
+        def remove_continuum(wave, spec, err=None, poly_order=3, get_cont=False):
 
-            flux_contrem = np.array(flux_contrem)
-            err_contrem = np.array(err_contrem)
-            continua = np.array(continua)
+            return_only_flux = False
+            if err is None:
+                return_only_flux = True
+                err = np.ones_like(spec)
 
-            if spec.ndim == 1:
-                flux_contrem, err_contrem, continua = flux_contrem[0], err_contrem[0], continua[0]
+            wave = np.asarray(wave.value if isinstance(wave, u.Quantity) else wave, dtype=float)
+            spec = np.asarray(spec.value if isinstance(spec, u.Quantity) else spec, dtype=float)
+            err  = np.asarray(err.value  if isinstance(err, u.Quantity)  else err,  dtype=float)
+            nans = np.isnan(spec)
 
-            return (flux_contrem, err_contrem, continua) if get_cont else (flux_contrem,err_contrem)
+            if spec.ndim == 1: # for template
+                continuum = np.poly1d(np.polyfit(wave[~nans],spec[~nans],poly_order))(wave)
+                flux_contrem = spec / continuum
+                err_contrem = err / continuum
+                if return_only_flux:
+                    return flux_contrem
+                return (flux_contrem, err_contrem, continuum) if get_cont else (flux_contrem, err_contrem)
 
-        flux_contrem, err_contrem, cont = remove_continuum(planet_wl_obs_range,transit_flux_array,transit_errors_array,get_cont=True)
-        
-        if plot:
-            plt.figure(figsize=(5,2))
-            im=plt.imshow(flux_contrem,aspect='auto')
-            plt.colorbar(im)
+            elif spec.ndim == 3: 
+                n_exp, n_orders, n_wave = spec.shape
+                flux_contrem = np.full(spec.shape,np.nan)
+                err_contrem=np.full(spec.shape,np.inf)
+                continua=np.full(spec.shape,np.nan)
+                for exp in range(n_exp):
+                    for order in range(n_orders):
+                        fl=spec[exp,order]
+                        flerr=err[exp,order]
+                        wl=wave[order]
+                        nans = np.isnan(fl)
+                        continuum_model = np.poly1d(np.polyfit(wl[~nans],fl[~nans],poly_order))
+                        continuum = continuum_model(wl)
+                        flux_contrem[exp,order][~nans] = fl[~nans]/continuum[~nans]
+                        err_contrem[exp,order][~nans] = flerr[~nans]/continuum[~nans]
+                        continua[exp,order] = continuum        
 
-        flux_off_transit_avg = np.zeros_like(flux_contrem)
-        off_transit_sum = np.zeros_like(flux_contrem[0])
-        for exp in range(num_exp):
-            if exp in in_transit:
-                pass
-            else:
-                fl=flux_contrem[exp]
-                off_transit_sum +=fl
-        flux_off_transit_avg = off_transit_sum/np.nanmedian(off_transit_sum)
+                return (flux_contrem, err_contrem, continua) if get_cont else (flux_contrem, err_contrem)
+
+        def mask_outliers(spec,specerr,sigma=outlier_sigma):
+            flux_out = np.copy(spec)
+            err_out=np.copy(specerr)
+            for exp in range(num_exp):
+                for order in range(num_orders):
+                    fl=flux_out[exp,order]
+                    std = np.nanstd(fl)
+                    mean = np.nanmedian(fl)
+                    outliers = (np.abs(fl-mean)/std)>sigma
+                    flux_out[exp,order][outliers] = np.nan
+                    err_out[exp,order][outliers] = np.inf
+            return flux_out,err_out
+
+        flux_contrem, err_contrem = remove_continuum(wave, flux, err)
+        # mask tellurics after removing continuum bc flux slope is too strong
+        flux_mask0,err_mask0 = mask_absorption_emission(flux_contrem,err_contrem,lowerlim=0.7,upperlim=np.nanmax(flux_contrem))
+        flux_mask1,err_mask1 = mask_outliers(flux_mask0,err_mask0,sigma=outlier_sigma)
+
+        flux_off_transit_avg = np.zeros_like(flux[0,:])
+        for order in range(num_orders):
+            off_transit_sum = np.zeros_like(flux[0,0])
+            for exp in range(num_exp):
+                if exp in self.in_transit:
+                    pass
+                else:
+                    fl=flux_mask1[exp,order]
+                    off_transit_sum +=fl
+            off_transit_avg= off_transit_sum/np.nanmedian(off_transit_sum)
+            flux_off_transit_avg[order]=off_transit_avg
 
         flux_avgrem=np.zeros_like(flux_contrem)
-        for exp in range(num_exp):
-            flux_avgrem[exp] = flux_contrem[exp]/flux_off_transit_avg
+        fluxerr_avgrem=np.zeros_like(flux_contrem)
+        for order in range(num_orders):
+            for exp in range(num_exp):
+                flux_avgrem[exp,order] = flux_mask1[exp,order]/flux_off_transit_avg[order]
+                fluxerr_avgrem[exp,order] = err_mask1[exp,order]/flux_off_transit_avg[order]
 
-        if plot: 
-            plt.figure(figsize=(5,2))
-            im=plt.imshow(flux_avgrem,aspect='auto')
-            plt.xlim(0,1000)
-            plt.colorbar(im)
+        def sysrem(flux,fluxerr,num_modes=systrem_iter):
 
-        def sysrem(flux,fluxerr,num_modes=4,plot=False):
-            #flux= (flux.T/np.nanmean(flux, axis=1)).T # normalize first, axis=1 is mean over each exposure
-            flux= (flux.T-np.nanmean(flux, axis=1)).T # shift mean to zero
-
+            #flux= (flux.T-np.nanmean(flux, axis=1)).T # shift mean to zero
             max_iterations_per_mode=1000
             a = np.ones(flux.shape[0]) # number of exposures
             residuals=np.copy(flux)
@@ -88,101 +130,134 @@ class CrossCorr:
                         break
                 residuals -= correction
 
-            if plot:
-                cmap="pink"
-                fig,ax=plt.subplots(2,1,figsize=(5,3),sharex=True)
-                im0=ax[0].imshow(flux, aspect='auto', interpolation='none',cmap=cmap)
-                ax[0].set_title("Before SysRem")
-                im1=ax[1].imshow(residuals, aspect='auto', interpolation='none',cmap=cmap)
-                ax[1].set_title("After SysRem")
-                ax[1].set_xlabel('Wavelength bins')
-                for i in range(2):
-                    ax[i].set_ylabel('Exposure #')
-                fig.tight_layout()
-
             return residuals    
 
-        temp_err = np.ones_like(transit_flux_array)*np.nanmedian(flux_avgrem)*0.01
-        flux_sysrem = sysrem(flux_avgrem,temp_err,num_modes=1,plot=True)
+        flux_sysrem=np.zeros((num_exp,num_orders,num_wave))
+        for i in range(num_orders): 
+            fl=flux_avgrem[:,i]
+            flerr=fluxerr_avgrem[:,i]
+            fl_new=sysrem(fl,flerr)
+            flux_sysrem[:,i]=fl_new
 
-        if plot:
-            plt.figure(figsize=(5,2))
-            im=plt.imshow(flux_sysrem,aspect='auto')
-            plt.xlim(0,1000)
-            plt.colorbar(im)
+        # one last outlier flagging before crosscorr
+        flux_mask2,fluxerr_mask2 =mask_outliers(flux_sysrem,fluxerr_avgrem,sigma=3)
 
-        RVs=np.arange(-200,200,1) # km/s
-        beta=1.0-RVs/const.c.to('km/s').value
+        self.RVs=np.arange(-200,200,1) # km/s
+        beta=1.0-self.RVs/const.c.to('km/s').value
 
-        template_wl = planet_wl_um 
-        template_flux = np.ones_like(delta_lambda)-delta_lambda 
+        if template is None: # use input
+            template_wl = self.planet_wl_um 
+            template_flux = np.ones_like(self.delta_lambda)-self.delta_lambda 
+        else:
+            template_path = pathlib.Path(f'{self.data_path}/{template}')
+            tbl = QTable.read(template_path)
+            template_wl = tbl['wavelength'] # in um
+            transit_radii_um = tbl['flux'] # in um
+            transit_radii_cm = (transit_radii_um.to(u.cm))
+            delta_lambda = ((transit_radii_cm / system_obj.R_star.to(u.cm))**2).value
+            template_flux = np.ones_like(delta_lambda)-delta_lambda 
 
-        wl=planet_wl_obs_range
-        fl=np.copy(flux_sysrem) # get all exposures
-        flerr=np.copy(temp_err)
-        flerr[flerr==0] = np.inf #every value with err=inf is not included in cc because of divide by err (weighting)
-        nans = np.isnan(fl)+np.isnan(flerr)
-        fl[nans] = 0
-        flerr[nans] = np.inf
-        wl_shift = wl[:, np.newaxis]*beta[np.newaxis, :]
-        template_shift=np.interp(wl_shift,template_wl,template_flux)
-        # do same for template as for spectra, remove cont with polydeg=3
-        template_shift=np.array([remove_continuum(wav,temp) for wav,temp in zip(wl_shift.T,template_shift.T)])
-        template_shift = template_shift - np.mean(template_shift, axis=0) # simplified continuum removal
-        CCF = (fl/flerr**2).dot(template_shift.T) # error weighted
+        self.CCF = np.zeros((num_exp,num_orders,len(self.RVs)))
+        for order in range(num_orders):
+            wl=wave[order] # wavelengths are same per exposure
+            fl=np.copy(flux_mask2[:,order]) # get all exposures per order
+            flerr=np.copy(fluxerr_mask2[:,order])
+            bad_pixels = ~np.isfinite(fl) | ~np.isfinite(flerr)
+            fl[bad_pixels] = 0
+            flerr[bad_pixels] = np.inf
+            wl_shift=wl[:, np.newaxis]*beta[np.newaxis, :]
+            template_shift=interp1d(template_wl,template_flux)(wl_shift) #interpolate template onto shifted wl-grid
+            # do same for template as for spectra, remove cont with polydeg=3
+            template_shift=np.array([remove_continuum(wav,temp) for wav,temp in zip(wl_shift.T,template_shift.T)])
+            template_shift = template_shift - np.mean(template_shift, axis=0) # simplified continuum removal
+            self.CCF[:,order] = (fl/flerr**2).dot(template_shift.T) #error weighted
 
-        if plot:
-            xmin, xmax = -30,30
-            plt.figure(figsize=(5,3))
-            im = plt.imshow(CCF,origin="lower",aspect='auto',
-                    extent=[np.min(RVs),np.max(RVs),np.min(phase_obs),np.max(phase_obs)])
-            plt.colorbar(im,label='CCF')
-            plt.plot(rv_transit,phase_transit,c='white',linestyle='dashed',alpha=0.5,lw=2)
-            plt.hlines(phase_transit[-1],xmin, xmax,color='white',linestyle='dashdot',alpha=0.8,lw=2)
-            plt.hlines(phase_transit[0],xmin, xmax,color='white',linestyle='dashdot',alpha=0.8,lw=2)
-            plt.xlabel('Radial velocity [km/s]')
-            plt.ylabel('Phase')
-            plt.xlim(xmin, xmax)
-
-        Kp_list = np.arange(0,300,1)#km/s
-        vsys_list=np.arange(-100,101,1) #km/s system velocities we want to shift to
+        self.Kp_list = np.arange(0,300,1)#km/s
+        self.vsys_list=np.arange(-100,101,1) #km/s system velocities we want to shift to
 
         def shift_and_sum(ccf,vsys_list,rv_list):
             # shift and sum everything in the transit to combine the signal
             # this will be one row of the ccf map for one Kp value
-            ccf_rest=np.zeros((num_exp,len(vsys_list)))
             tot_ccf =np.zeros(vsys_list.shape) # or tot_ccf=0
-            for exp in in_transit:
-                x = RVs
-                y = ccf[exp] 
-                interp = interp1d(x, y, assume_sorted=True,bounds_error=False)(rv_list[exp]+vsys_list) 
-                tot_ccf = np.nansum(np.stack((tot_ccf,interp)),axis=0)
+            for exp in self.in_transit:
+                x = self.RVs
+                y = ccf[exp]
+                interp=interp1d(x, y, assume_sorted=True,bounds_error=False)(rv_list[exp]+vsys_list) 
+                tot_ccf=np.nansum(np.stack((tot_ccf,interp)),axis=0)
             return tot_ccf    
-
-        def get_velocity_map(CCFs):
-            CCF_tot = np.zeros((len(Kp_list),len(vsys_list)))
-            for ikp in range(len(Kp_list)):
-                rv_list = Kp_list[ikp]*np.sin(2*np.pi*phase_obs) # calc planet rv for different Kp values
-                CCF_tot[ikp] = shift_and_sum(CCFs,vsys_list,rv_list)
+            
+        def get_Kp_vsys_map(CCFs):
+            CCF_tot = np.zeros((len(self.Kp_list),len(self.vsys_list)))
+            for ikp in range(len(self.Kp_list)):
+                rv_list = self.Kp_list[ikp]*np.sin(2*np.pi*self.phase_obs) #calc planet rv for different Kp values
+                CCF_tot[ikp] = shift_and_sum(CCFs,self.vsys_list,rv_list)
             return CCF_tot    
 
-        Kp_vsys_map = get_velocity_map(CCF)
-        noise = np.std(Kp_vsys_map[:,np.abs(vsys_list)>40],axis=1)[:, None]
+        CCF_sum=np.sum(self.CCF,axis=1) # sum CCF over all orders
+        Kp_vsys_map = get_Kp_vsys_map(CCF_sum)
+        noise=np.std(Kp_vsys_map[:,np.abs(self.vsys_list)>30],axis=1)[:, None]
+        self.Kp_vsys_map = Kp_vsys_map/noise #normalize along rv axis to get ccf map in snr units
 
-        # mask out regions close to the expected values (small rvs close to 0), because they create a larger std
-        Kp_vsys_map /= noise # normalize along rv axis to get ccf map in snr units
-        maxlocid=np.where(Kp_vsys_map==np.nanmax(Kp_vsys_map))
+        # S/N at expected self.Kp and vsys
+        Kp_idx = find_nearest(self.Kp_list,value=self.Kp.value)
+        vsys_idx = find_nearest(self.vsys_list,value=0)
+        self.vsys0 = self.vsys_list[vsys_idx]
+        self.Kp0 = self.Kp_list[Kp_idx]
+        self.SNR_planet = self.Kp_vsys_map[Kp_idx,vsys_idx]
 
-        # S/N at expected Kp and vsys
-        vsys0 = vsys_list[find_nearest(vsys_list,value=0)]
-        Kp0 = Kp_list[find_nearest(Kp_list,value=Kp.value)]
-        SNR_planet = Kp_vsys_map[Kp0,vsys0]
+        if plot_order is not None:
+            self.plot_calib_steps(wave,flux,flux_contrem,flux_avgrem,flux_sysrem,plot_order)
+            self.plot_CCF(plot_order=0)
+            self.plot_Kp_vsys()
 
-        if plot:
-            plt.figure(figsize=(5,3))
-            im=plt.imshow(Kp_vsys_map,aspect='auto',origin='lower',
-                        extent=[np.min(vsys_list),np.max(vsys_list),np.min(Kp_list),np.max(Kp_list)])
-            plt.scatter(vsys0,Kp0,marker='x',c='white',s=20)
-            plt.xlabel(r'$\Delta v_{\mathrm{sys}}$ [km/s]')
-            plt.ylabel(r'K$_{\mathrm{p}}$')
-            plt.colorbar(im,label='S/N')
+    def plot_calib_steps(self,wl,fl_orig,fl_contrem,fl_avgrem,fl_sysrem,plot_order):
+
+        fig,(ax1,ax2,ax3,ax4)=plt.subplots(4,1,figsize=(7,6),dpi=200,sharex=True)
+        extent=[np.min(wl),np.max(wl),0,fl_orig.shape[0]]
+
+        def imshow(ax,arr,title,vmin=0.5,vmax=99.5):
+            slice_ = arr[:,plot_order,:]
+            im=ax.imshow(slice_,aspect='auto', origin ='lower',extent=extent,
+                        vmin=np.nanpercentile(slice_, vmin), vmax=np.nanpercentile(slice_, vmax))
+            fig.colorbar(im,ax=ax)
+            ax.set_title(title)
+
+        imshow(ax1,fl_orig,f'Original flux, order {plot_order}')
+        imshow(ax2,fl_contrem,'Continuum removed')
+        imshow(ax3,fl_avgrem,'Average off-transit removed')
+        imshow(ax4,fl_sysrem,'After Sysrem')
+
+        ax4.set_xlabel('Wavelength [um]')
+        fig.tight_layout()
+        fig.savefig(f'{self.data_path}/figures/calib_steps.pdf', bbox_inches='tight')
+        plt.close()
+
+    def plot_CCF(self,plot_order):
+        xmin, xmax = -30,30
+        fig = plt.figure(figsize=(5,3),dpi=150)
+        im = plt.imshow(self.CCF[:,plot_order,:],origin="lower",aspect='auto',
+                extent=[np.min(self.RVs),np.max(self.RVs),np.min(self.phase_obs),np.max(self.phase_obs)])
+        plt.colorbar(im,label='CCF')
+        plt.plot(self.rv_transit,self.phase_transit,c='white',linestyle='dashed',alpha=0.5,lw=2)
+        plt.hlines(self.phase_transit[-1],xmin, xmax,color='white',linestyle='dashdot',alpha=0.8,lw=2)
+        plt.hlines(self.phase_transit[0],xmin, xmax,color='white',linestyle='dashdot',alpha=0.8,lw=2)
+        plt.xlabel('Radial velocity [km/s]')
+        plt.ylabel('Phase')
+        plt.xlim(xmin, xmax)
+        fig.savefig(f'{self.data_path}/figures/CCF.pdf', bbox_inches='tight')
+        plt.close()
+    
+    def plot_Kp_vsys(self):
+        fig = plt.figure(figsize=(5,3),dpi=150)
+        im=plt.imshow(self.Kp_vsys_map,aspect='auto',origin='lower',
+                    extent=[np.min(self.vsys_list),np.max(self.vsys_list),np.min(self.Kp_list),np.max(self.Kp_list)])
+        plt.scatter(self.vsys0,self.Kp0,marker='x',c='hotpink',s=20,label=fr"S/N$_{{\mathrm{{planet}}}}$ = {self.SNR_planet:.1f}")
+        maxlocid=np.where(self.Kp_vsys_map==np.nanmax(self.Kp_vsys_map))
+        SNR_max = self.Kp_vsys_map[maxlocid[0][0],maxlocid[1][0]]
+        #plt.scatter(self.vsys_list[maxlocid[1][0]],self.Kp_list[maxlocid[0][0]],marker='x',c='r',s=20,label=fr"S/N$_{{\mathrm{{max}}}}$ = {SNR_max:.1f}")
+        plt.xlabel(r'$\Delta v_{\mathrm{sys}}$ [km/s]')
+        plt.ylabel(r'$K_{\mathrm{p}}$ [km/s]')
+        plt.colorbar(im,label='S/N')
+        plt.legend()
+        fig.savefig(f'{self.data_path}/figures/Kp_vsys.pdf', bbox_inches='tight')
+        plt.close()

@@ -2,10 +2,13 @@ import numpy as np
 import astropy.units as u
 import wget
 import os
+from petitRADTRANS.config import petitradtrans_config_parser
+petitradtrans_config_parser.set_input_data_path('/net/lem/data2/pRT3_formatted')
 import pathlib
 from astropy.io import fits
 from astropy.table import QTable
 from utils import *
+import matplotlib.pyplot as plt
 from petitRADTRANS.radtrans import Radtrans
 from petitRADTRANS import physical_constants as cst
 
@@ -16,6 +19,8 @@ class System:
         self.name=name
         self.data_path = os.path.join(os.getcwd(),name)
         self.exptime = exptime
+        figs_path = pathlib.Path(f'{self.data_path}/figures')
+        figs_path.mkdir(parents=True, exist_ok=True)
 
         self.R_star = 0.5 * u.R_sun # stellar radius
         self.d_star = 38 * u.pc # distance to K2-18
@@ -24,27 +29,28 @@ class System:
         period = 10.0*u.day # USE SHORTER PERIOD FOR TESTING -> larger Kp
         incl = 89.57*u.deg # inclination
         e = 0.0
-        Kp = ((2*np.pi*sma*np.sin(incl))/(period*np.sqrt(1-e**2))).to(u.km/u.s) # RV semi-amplitude
-        #print(f"Kp = {Kp:.3f}")
+        self.Kp = ((2*np.pi*sma*np.sin(incl))/(period*np.sqrt(1-e**2))).to(u.km/u.s) # RV semi-amplitude
+        #print(f"Kp = {self.Kp:.3f}")
 
         transit_duration = 2.67*u.h
         num_exp_in_transit = int(transit_duration.to(u.s)/exptime) # number of exposures during transit
         delta_phase = (transit_duration.to(u.day)/2/period).value # half duration in phase
-        phase_transit = np.linspace(-delta_phase,delta_phase,num_exp_in_transit) # phase during transit
-        rv_transit = Kp*np.sin(2*np.pi*phase_transit)
-        #print(f"RV at ingress/egress: +/- {np.max(rv_transit):.3f}")
+        self.phase_transit = np.linspace(-delta_phase,delta_phase,num_exp_in_transit) # phase during transit
+        self.rv_transit = self.Kp*np.sin(2*np.pi*self.phase_transit)
+        #print(f"RV at ingress/egress: +/- {np.max(self.rv_transit):.3f}")
 
         self.overhead = int(10) # total -> make even number
         self.num_exp = num_exp_in_transit + self.overhead # total number of exposures
         idx = np.arange(self.num_exp)
         t_offsets = (idx - (self.num_exp - 1)/2.0) * exptime # time offset (in u.s) symmetric around mid-transit t=0
         t_offsets_days = t_offsets.to(u.day)
-        phase_obs = (t_offsets_days / period).decompose().value # phase during observation (transit + overhead)
-        self.rv_obs = Kp * np.sin(2.0 * np.pi * phase_obs) 
+        self.phase_obs = (t_offsets_days / period).decompose().value # phase during observation (transit + overhead)
+        self.rv_obs = self.Kp * np.sin(2.0 * np.pi * self.phase_obs) 
         #print(f"RV at obs start/end: +/- {np.max(rv_obs):.3f}")
 
         self.planet_wl_um, transit_radii_um  = self.get_planet_spectrum()
-        self.delta_lambda = ((transit_radii_um.to(u.cm) / self.R_star.to(u.cm))**2).value  # wavelength-dependent transit depth
+        self.transit_radii_cm = (transit_radii_um.to(u.cm))
+        self.delta_lambda = ((self.transit_radii_cm / self.R_star.to(u.cm))**2).value  # wavelength-dependent transit depth
         star_wl, star_flx = self.get_stellar_spectrum()
 
         # interpolate stellar flux onto planet wavelength grid
@@ -117,12 +123,9 @@ class System:
             
             fname = f'lte{t_val:05d}-{log_g_val:.2f}{sign_specifier}{np.abs(fe_h_val):.1f}.PHOENIX-ACES-AGSS-COND-2011-HiRes.fits'
             fpath = f'ftp://phoenix.astro.physik.uni-goettingen.de/HiResFITS/PHOENIX-ACES-AGSS-COND-2011/Z-0.0/{fname}'
-
-            data_path = os.getcwd()
-            savepath = os.path.join(data_path, fname)
-            
+            savepath = os.path.join(self.data_path, fname)
             wave_path = 'ftp://phoenix.astro.physik.uni-goettingen.de/HiResFITS/WAVE_PHOENIX-ACES-AGSS-COND-2011.fits'
-            wave_savepath = os.path.join(data_path, 'WAVE_PHOENIX-ACES-AGSS-COND-2011.fits')
+            wave_savepath = os.path.join(self.data_path, 'WAVE_PHOENIX-ACES-AGSS-COND-2011.fits')
 
             # Download wavelength grid if missing
             if not os.path.exists(wave_savepath):
@@ -143,7 +146,7 @@ class System:
             mask = (wavelengths >= wl_lims[0]) & (wavelengths <= wl_lims[1])
             return wavelengths[mask], flux_density[mask]
 
-        star_template = pathlib.Path(f'M2_star.fits')
+        star_template = pathlib.Path(f'{self.data_path}/M2_star.fits')
         if star_template.exists():
             tbl = QTable.read(star_template)
             star_wl = tbl['wavelength']
@@ -155,37 +158,86 @@ class System:
 
         return star_wl, star_flx
     
-    def get_transit_array(self,wl_obs_range):
+    def get_transit_array(self, wl_obs_range):
+        """
+        Build time-series transit spectra interpolated onto a chosen observed wavelength range.
+        """
 
-        wl_mask = (self.planet_wl_um>np.min(wl_obs_range)) & (self.planet_wl_um<np.max(wl_obs_range[-1]))
+        # Ensure wl_obs_range is a Quantity in same unit as planet_wl_um
+        wl_min, wl_max = wl_obs_range
+        wl_min = wl_min * self.planet_wl_um.unit if not isinstance(wl_min, u.Quantity) else wl_min
+        wl_max = wl_max * self.planet_wl_um.unit if not isinstance(wl_max, u.Quantity) else wl_max
+
+        # Select observed wavelength range
+        wl_mask = (self.planet_wl_um > wl_min) & (self.planet_wl_um < wl_max)
         planet_wl_obs_range = self.planet_wl_um[wl_mask]
-        self.in_transit = np.linspace(self.overhead//2,self.num_exp-self.overhead//2-1,self.num_exp-self.overhead,dtype=int)
-        transit_flux_array = np.empty(shape=(self.num_exp,len(planet_wl_obs_range.value)))
 
+        # Indices of exposures that are in transit
+        self.in_transit = np.linspace(self.overhead // 2, self.num_exp - self.overhead // 2 - 1,
+                                      self.num_exp - self.overhead, dtype=int)
+
+        # Initialize with units
+        transit_flux_array = np.empty((self.num_exp, len(planet_wl_obs_range))) * self.star_flx_interp.unit
+
+        # Loop over exposures
         for i in range(self.num_exp):
             if i in self.in_transit:
+                # Radial velocity shift
+                rv = self.rv_obs[i]
+                rv = rv.to(u.km / u.s) if isinstance(rv, u.Quantity) else rv * u.km / u.s
+                beta = (1.0 + rv / const.c.to("km/s")).value
+                wl_shifted = beta * self.planet_wl_um
 
-                    rv = self.rv_obs[i]
-                    rv = rv.to(u.km/u.s) if isinstance(rv, u.Quantity) else rv * u.km/u.s
-                    beta = (1+rv/const.c.to('km/s')).value
-                    wl_shifted = beta*self.planet_wl_um
-                    
-                    # convert to transit depth
-                    delta_lambda_interp = np.interp(planet_wl_obs_range, wl_shifted, self.delta_lambda)
-                    star_flux_interp = np.interp(planet_wl_obs_range, self.planet_wl_um, self.star_flx_interp)
-                    transit_flux = star_flux_interp * (1.0 - delta_lambda_interp)
-                    transit_flux_earth = (transit_flux * (self.R_star / self.d_star)**2).to(transit_flux.unit) # scale by distance
-                    transit_flux_array[i] = transit_flux_earth.value
-                    
+                # Interpolate transit depth and stellar flux
+                delta_lambda_interp = np.interp(planet_wl_obs_range.value, wl_shifted.value, self.delta_lambda)
+                star_flux_interp = np.interp(planet_wl_obs_range.value, self.planet_wl_um.value,
+                                            self.star_flx_interp.value) * self.star_flx_interp.unit
+
+                # Apply transit depth
+                transit_flux = star_flux_interp * (1.0 - delta_lambda_interp)
+
+                # Scale to Earth
+                transit_flux_earth = (transit_flux * (self.R_star / self.d_star) ** 2).to(star_flux_interp.unit)
+                transit_flux_array[i] = transit_flux_earth
+
             else:
-                star_flux_only = np.interp(planet_wl_obs_range,self.planet_wl_um,self.star_flx_interp)
-                star_flux_only_earth = (star_flux_only * (self.R_star / self.d_star)**2).to(star_flux_only.unit) # scale by distance
+                # Star-only flux (no transit)
+                star_flux_only = np.interp(planet_wl_obs_range.value, self.planet_wl_um.value,
+                                            self.star_flx_interp.value) * self.star_flx_interp.unit
+
+                star_flux_only_earth = (star_flux_only * (self.R_star / self.d_star) ** 2).to(star_flux_only.unit)
                 transit_flux_array[i] = star_flux_only_earth
-                        
-            transit_flux_array *= self.star_flx_interp.unit  
-            self.planet_wl_obs_range = planet_wl_obs_range
-            return transit_flux_array
 
+        # Save to object for later use
+        self.planet_wl_obs_range = planet_wl_obs_range
+        self.transit_flux_array = transit_flux_array
 
+        return transit_flux_array
+    
+    def plot_transit_timeseries(self):
+        fig,ax=plt.subplots(1,1,figsize=(7,3),dpi=100)
+        im = ax.imshow(self.transit_flux_array.value,aspect='auto',
+                       extent=[np.min(self.planet_wl_um.value),np.max(self.planet_wl_um.value),
+                        0,self.num_exp])
+        plt.colorbar(im)
+        ax.set_ylabel(f'Exposures')
+        ax.set_xlabel(f'Wavelength [{self.planet_wl_um.unit}]')
+        fig.savefig(f'{self.data_path}/figures/input_transit_timeseries.pdf', bbox_inches='tight')
+        plt.close()
 
+    def plot_stellar_spectrum(self):
+        fig,ax=plt.subplots(1,1,figsize=(7,3),dpi=100)
+        ax.plot(self.planet_wl_um.value,self.star_flx_interp, color='black',lw=0.5,label='Planet host')
+        plt.legend()
+        ax.set_ylabel(f'Flux [{self.star_flx_interp.unit}]')
+        ax.set_xlabel(f'Wavelength [{self.planet_wl_um.unit}]')
+        fig.savefig(f'{self.data_path}/figures/stellar_spectrum.pdf', bbox_inches='tight')
+        plt.close()
 
+    def plot_planet_transmission(self):
+        fig,ax=plt.subplots(1,1,figsize=(7,3),dpi=100)
+        ax.plot(self.planet_wl_um, self.transit_radii_cm / cst.r_jup_mean,lw=0.5)
+        ax.set_xlabel(f'Wavelength [{self.planet_wl_um.unit}]')
+        ax.set_ylabel(r'Transit radius [$\rm R_{Jup}$]')
+        fig.savefig(f'{self.data_path}/figures/planet_spectrum.pdf', bbox_inches='tight')
+        plt.close()

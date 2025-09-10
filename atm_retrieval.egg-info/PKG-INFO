@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: atm_retrieval
+Version: 0.1.0
+Summary: A package for simulating exoplanet transmission spectroscopy with ELT/METIS
+Author: Natalie Grasser
+Author-email: grasser@strw.leidenuniv.nl
+Dynamic: author
+Dynamic: author-email
+Dynamic: summary

@@ -1,3 +1,5 @@
+import os
+os.environ["SCOPESIM_INSTRUMENTS"] = '/net/lem/data1/grasser/ScopeSim_Templates'
 import scopesim as sim
 import scopesim_templates as sim_tp
 import numpy as np
@@ -20,12 +22,15 @@ class METIS:
                        properties={"!OBS.wavelen": central_wavelength})
         self.metis = sim.OpticalTrain(self.cmd)
         
-    def observe_transit_calib(self,transit_flux_array):
+    def observe_transit_calib(self,transit_flux_array,output_dir,plot_exp=None):
+
+        self.output_dir = pathlib.Path(f'{self.data_path}/transit/{output_dir}')
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
         transit_simulated_frames = []
         for i,fl in enumerate(transit_flux_array):
             
-            hdul_src_path = pathlib.Path(f'{self.data_path}/transit/transit_frame_{int(i)}.fits')
+            hdul_src_path = pathlib.Path(f'{self.output_dir}/transit_frame_{int(i)}.fits')
             
             if hdul_src_path.exists():
                 hdul_src = fits.open(hdul_src_path)
@@ -45,7 +50,7 @@ class METIS:
         self.hdr = hdul_src[1].header
 
         # dark current
-        master_dark_path = pathlib.Path(f'{self.data_path}/transit/master_dark.fits')
+        master_dark_path = pathlib.Path(f'{self.output_dir}/master_dark.fits')
 
         if master_dark_path.exists():
             master_dark_hdul = fits.open(master_dark_path)
@@ -70,7 +75,7 @@ class METIS:
             master_dark_hdul.writeto(master_dark_path, overwrite=True)
 
         # dark current
-        master_dark_path = pathlib.Path(f'{self.data_path}/transit/master_dark.fits')
+        master_dark_path = pathlib.Path(f'{self.output_dir}/master_dark.fits')
 
         if master_dark_path.exists():
             master_dark_hdul = fits.open(master_dark_path)
@@ -95,7 +100,7 @@ class METIS:
             master_dark_hdul.writeto(master_dark_path, overwrite=True)
             
         # flat-field
-        master_flat_path = pathlib.Path(f'{self.data_path}/transit/master_flat.fits')
+        master_flat_path = pathlib.Path(f'{self.output_dir}/master_flat.fits')
 
         if master_flat_path.exists():
             master_flat_hdul = fits.open(master_flat_path)
@@ -128,7 +133,7 @@ class METIS:
             master_flat_hdul.writeto(master_flat_path, overwrite=True)
             
         # empty sky
-        hdul_sky_path = pathlib.Path(f'{self.data_path}/transit/hdul_sky.fits')
+        hdul_sky_path = pathlib.Path(f'{self.output_dir}/hdul_sky.fits')
 
         if hdul_sky_path.exists():
             hdul_sky = fits.open(hdul_sky_path)
@@ -138,14 +143,18 @@ class METIS:
             hdul_sky = self.metis.readout(exptime=self.exptime.value)[0]
             hdul_sky.writeto(hdul_sky_path, overwrite=True)
 
+        if plot_exp is not None: # plot exposure
+            self.plot_raw_whitelight(transit_simulated_frames[plot_exp],master_flat_hdul,
+                                     master_dark_hdul,hdul_sky,plot_exp=plot_exp)
+
         return transit_simulated_frames, master_dark_hdul, master_flat_hdul, hdul_sky
     
     def rectify_calibrate_extract(self, 
                                   transit_simulated_frames, master_dark_hdul, 
-                                  master_flat_hdul, hdul_sky):
+                                  master_flat_hdul, hdul_sky, plot_exp=None):
 
         def get_rectified(target,hdul_raw):
-            rect_path = pathlib.Path(f'{self.data_path}/transit/rectified_{target}.fits')
+            rect_path = pathlib.Path(f'{self.output_dir}/rectified_{target}.fits')
             if rect_path.exists():
                 rect = fits.open(rect_path)[1]
             else:
@@ -159,10 +168,11 @@ class METIS:
 
         rect_src_frames = []
         for i,hdul_src in enumerate(transit_simulated_frames):
+            #print(i)
             rect_src = get_rectified(f'src_{i}',hdul_src)
             rect_src_frames.append(rect_src)
 
-        # just take wavelength daata from the first, is same for all
+        # just take wavelength data from the first, is same for all
         self.hdr['CRVAL3'] = rect_src.header['CRVAL3']
         self.hdr['CRPIX3'] = rect_src.header['CRPIX3']
         self.hdr['CDELT3'] = rect_src.header['CDELT3']
@@ -170,7 +180,6 @@ class METIS:
         del transit_simulated_frames # memory issues
 
         # remove edge pixels (near-zero flux)
-
         clip_x = 2 
         sky = rect_sky.data.astype(float)[:, :, clip_x:-clip_x]
         dark = rect_dark.data.astype(float)[:, :, clip_x:-clip_x]
@@ -183,6 +192,40 @@ class METIS:
             nwave = rect.shape[0]
             wl = crval + (np.arange(1, nwave+1) - crpix) * cdelt
             return wl, nwave
+
+        def get_quantum_efficiency(metis, wave_array):
+            wave_array = np.array(wave_array)
+            qe_file_rel = metis.cmds["!DET.qe_curve"]["file_name"]
+            qe_file = find_file(qe_file_rel)
+            wl, qe = np.loadtxt(qe_file, unpack=True, comments="#",skiprows=15)
+            qe_interp = np.interp(wave_array, wl, qe)
+            return qe_interp
+
+        def compute_variance_from_rectified_cube(metis, rectified, wavelengths):
+
+            data_adu = rectified.data  # shape (nwave, ny, nx)
+            exptime = metis.cmds["!OBS.exptime"]
+            ndit = metis.cmds.get("!OBS.ndit", 1)
+            gain = 2.0  # e-/ADU
+            dark_current = metis.cmds.get("!DET.dark_current", 0.1)  # e-/s
+            read_noise = metis.cmds.get("!DET.readout_noise", 70.0)  # e-/DIT
+            
+            qe = get_quantum_efficiency(metis,wavelengths)  # shape: (nwave,)
+            qe_cube = qe[:, np.newaxis, np.newaxis] # reshape for broadcasting: (nwave, 1, 1)
+            data_e = data_adu * gain * ndit # photon noise in electrons
+            photon_var_e = data_e * qe_cube  # poisson processes (photon arrival): variance = expected number of counts
+            dark_var_e = dark_current * exptime * ndit # dark noise
+            read_var_e = (read_noise**2) * ndit # readout noise
+            total_var_e = photon_var_e + dark_var_e + read_var_e # total variance in electrons
+            var_cube = total_var_e / (gain**2) # convert back to ADU^2
+            
+            return var_cube
+    
+        # remove edge pixels (near-zero flux)
+        clip_x = 2 
+        sky = rect_sky.data.astype(float)[:, :, clip_x:-clip_x]
+        dark = rect_dark.data.astype(float)[:, :, clip_x:-clip_x]
+        flat = rect_flat.data.astype(float)[:, :, clip_x:-clip_x]
 
         def get_quantum_efficiency(metis, wave_array):
             wave_array = np.array(wave_array)
@@ -223,73 +266,19 @@ class METIS:
             src_dark_flat =  src_dark / flat
             sky_dark_flat =  sky_dark / flat
             src_minus_sky = src_dark_flat - sky_dark_flat
+
+            if plot_exp is not None:
+                if i==plot_exp:
+                    self.plot_rectified(src,dark,src_dark_flat,flat,src_minus_sky,sky_dark_flat,plot_exp)
+
             calib_frames.append(src_minus_sky)
             var_cube = compute_variance_from_rectified_cube(self.metis, rect_src, wavelengths)[:, :, clip_x:-clip_x]
             var_cubes.append(var_cube)
-    
-        del rect_src_frames# remove edge pixels (near-zero flux)
 
-        clip_x = 2 
-        sky = rect_sky.data.astype(float)[:, :, clip_x:-clip_x]
-        dark = rect_dark.data.astype(float)[:, :, clip_x:-clip_x]
-        flat = rect_flat.data.astype(float)[:, :, clip_x:-clip_x]
-
-        def get_wavelegth_from_header(rect, header):
-            crval = float(header['CRVAL3'])
-            crpix = float(header['CRPIX3'])
-            cdelt = float(header['CDELT3'])
-            nwave = rect.shape[0]
-            wl = crval + (np.arange(1, nwave+1) - crpix) * cdelt
-            return wl
-
-        def get_quantum_efficiency(metis, wave_array):
-            wave_array = np.array(wave_array)
-            qe_file_rel = metis.cmds["!DET.qe_curve"]["file_name"]
-            qe_file = find_file(qe_file_rel)
-            wl, qe = np.loadtxt(qe_file, unpack=True, comments="#",skiprows=15)
-            qe_interp = np.interp(wave_array, wl, qe)
-            return qe_interp
-
-        def compute_variance_from_rectified_cube(metis, rectified,wavelengths):
-
-            data_adu = rectified.data  # shape (nwave, ny, nx)
-            exptime = metis.cmds["!OBS.exptime"]
-            ndit = metis.cmds.get("!OBS.ndit", 1)
-            gain = 2.0  # e-/ADU
-            dark_current = metis.cmds.get("!DET.dark_current", 0.1)  # e-/s
-            read_noise = metis.cmds.get("!DET.readout_noise", 70.0)  # e-/DIT
-            
-            qe = get_quantum_efficiency(metis,wavelengths)  # shape: (nwave,)
-            qe_cube = qe[:, np.newaxis, np.newaxis] # reshape for broadcasting: (nwave, 1, 1)
-            data_e = data_adu * gain * ndit # photon noise in electrons
-            photon_var_e = data_e * qe_cube  # poisson processes (photon arrival): variance = expected number of counts
-            dark_var_e = dark_current * exptime * ndit # dark noise
-            read_var_e = (read_noise**2) * ndit # readout noise
-            total_var_e = photon_var_e + dark_var_e + read_var_e # total variance in electrons
-            var_cube = total_var_e / (gain**2) # convert back to ADU^2
-            
-            return var_cube
-
-        calib_frames = []
-        var_cubes = []
-        for i,rect_src in enumerate(rect_src_frames):
-            if i==0:
-                wavelengths = get_wavelegth_from_header(rect_src, self.hdr)
-            src = rect_src.data.astype(float)[:, :, clip_x:-clip_x]
-            src_dark = src - dark
-            sky_dark = sky - dark
-            src_dark_flat =  src_dark / flat
-            sky_dark_flat =  sky_dark / flat
-            src_minus_sky = src_dark_flat - sky_dark_flat
-            calib_frames.append(src_minus_sky)
-            var_cube = compute_variance_from_rectified_cube(self.metis, rect_src, wavelengths)[:, :, clip_x:-clip_x]
-            var_cubes.append(var_cube)
-            
-        @staticmethod
         def find_and_extract_trace(cube, var_cube=None, wavelengths=None,
                                 aperture_halfwidth=3, 
                                 smooth_sigma=2.0, signal_frac_thresh=0.3, 
-                                poly_order=3, plot_diagnostics=False):
+                                poly_order=3, plot_diagnostics=False, plot_exp=None):
             """
             Find spectral trace in a rectified cube and extract a 1D spectrum.
             cube shape: (nwave, ny, nx) where axis0 is wavelength.
@@ -308,25 +297,35 @@ class METIS:
             maxvals = np.zeros(nwave)
             for i in range(nwave):
                 profile_y = np.nansum(cube[i,:,:], axis=1)
-                maxvals[i] = np.nanmax(profile_y)
+                # negative values from background subtraction or noise -> just normalize
+                profile_y -= np.nanmin(profile_y)   # shift baseline to zero
+                if np.nanmax(profile_y) > 0: # avoid division by 0
+                    profile_y /= np.nanmax(profile_y)
+
+                # --- after normalization ---
+                maxvals[i] = np.nanmax(profile_y)   # will always be 1.0 if not flat
                 peak_y[i] = np.nanargmax(profile_y)
-                frac_nonzero[i] = np.sum(profile_y > 0) / float(len(profile_y))
+                frac_nonzero[i] = np.sum(profile_y > 0.3) / float(len(profile_y))  
 
             median_bg = np.median(maxvals)
-            sig_mask = (maxvals > np.maximum(3.0 * np.std(maxvals), median_bg * 1.2))
-            sig_mask |= (frac_nonzero > signal_frac_thresh)
+            #sig_mask = (maxvals > np.maximum(3.0 * np.std(maxvals), median_bg * 1.2))
+            #sig_mask |= (frac_nonzero > signal_frac_thresh)
+            #sig_mask = (maxvals > median_bg * 1.2)
+            sig_mask = (maxvals > 0.5) | (frac_nonzero > signal_frac_thresh)
 
-            if plot_diagnostics:
+
+            if plot_exp is not None and plot_diagnostics:
                 fig, ax = plt.subplots(2,1,figsize=(5,3), sharex=True)
                 ax[0].plot(maxvals, label='slice max (y profile)', lw=0.8)
                 ax[0].axhline(median_bg, color='k', linestyle=':', label='median')
                 ax[0].legend(fontsize=8)
                 ax[1].plot(frac_nonzero, label='frac_nonzero (y profile)')
-                ax[1].axhline(signal_frac_thresh, color='r', linestyle='--', label='frac thresh')
+                #ax[1].axhline(signal_frac_thresh, color='r', linestyle='--', label='frac thresh')
                 ax[1].legend(fontsize=8)
                 ax[1].set_xlabel('wavelength index')
                 plt.subplots_adjust(hspace=0)
-                plt.show()
+                fig.savefig(f'{self.data_path}/figures/extract_yprof_{plot_exp}.pdf', bbox_inches='tight')
+                plt.close()
 
             # 3) fit trace
             good_idxs = np.where(sig_mask)[0]
@@ -336,8 +335,8 @@ class METIS:
             p = np.polyfit(good_idxs, centroids_smooth, deg=poly_order)
             trace_y = np.polyval(p, np.arange(nwave))
                 
-            if plot_diagnostics:
-                plt.figure(figsize=(5,2))
+            if plot_exp is not None and plot_diagnostics:
+                fig = plt.figure(figsize=(5,2))
                 im = plt.imshow(white, origin='lower', aspect='auto', cmap='inferno')
                 # overlay predicted trace
                 xs = np.linspace(0, nx-1, nx)
@@ -350,7 +349,8 @@ class METIS:
                 plt.title('White light with fitted trace (approx mapping)')
                 plt.colorbar(im)
                 plt.legend()
-                plt.show()
+                fig.savefig(f'{self.data_path}/figures/extract_trace_{plot_exp}.pdf', bbox_inches='tight')
+                plt.close()
 
             # 4) extract spectrum (updated)
             spec = np.zeros(nwave)
@@ -393,10 +393,16 @@ class METIS:
         fluxes_obs = []
         err_obs = []
         for i,calib in enumerate(calib_frames):
-            
-            wl_obs, flx_obs, flx_obs_err, _ = find_trace_and_extract(calib, 
+
+            if i==plot_exp:
+                plot_diagnostics = True
+            else:
+                plot_diagnostics = False
+            wl_obs, flx_obs, flx_obs_err, _ = find_and_extract_trace(calib, 
                                                             var_cube=var_cubes[i], 
-                                                            wavelengths=wavelengths)
+                                                            wavelengths=wavelengths,
+                                                            plot_diagnostics=plot_diagnostics,
+                                                            plot_exp=plot_exp)
             fluxes_obs.append(flx_obs)
             err_obs.append(flx_obs_err)
 
@@ -404,5 +410,60 @@ class METIS:
         fluxes_obs = np.array(fluxes_obs)
         err_obs = np.array(err_obs)
 
+        if plot_exp is not None:
+            self.plot_extracted_spetrum(wl_obs,fluxes_obs[plot_exp],
+                                        err_obs[plot_exp],plot_exp=plot_exp)
+
         return wl_obs, fluxes_obs, err_obs
-            
+
+    def plot_raw_whitelight(self,hdul_src,master_flat_hdul,master_dark_hdul,hdul_sky,plot_exp=''):
+        # Compare white-light images before rectification
+        x = 1
+        src_white_raw  = hdul_src[x].data.astype(float)
+        flat_raw= master_flat_hdul[x].data.astype(float)
+        dark_raw= master_dark_hdul[x].data.astype(float)
+        sky_white_raw= hdul_sky[x].data.astype(float)
+
+        fig, ax = plt.subplots(2,2,figsize=(7,6))
+        im0 = ax[0,0].imshow(src_white_raw, vmin=0, vmax=np.percentile(src_white_raw, 99), aspect='auto')
+        ax[0,0].set_title("Science (raw white-light)")
+        plt.colorbar(im0,ax=ax[0,0])
+        im1 = ax[1,0].imshow(flat_raw, vmin=0,vmax=np.nanpercentile(flat_raw,99), aspect='auto')
+        ax[1,0].set_title("Flat (raw)")
+        plt.colorbar(im1,ax=ax[1,0])
+        im2 = ax[0,1].imshow(sky_white_raw, vmin=0, vmax=np.percentile(sky_white_raw, 99), aspect='auto')
+        ax[0,1].set_title("Sky (raw white-light)")
+        plt.colorbar(im2,ax=ax[0,1])
+        im3 = ax[1,1].imshow(dark_raw, vmin=0, vmax=np.percentile(dark_raw, 99), aspect='auto')
+        ax[1,1].set_title("Dark (raw)")
+        plt.colorbar(im3,ax=ax[1,1])
+        fig.tight_layout()
+        fig.savefig(f'{self.data_path}/figures/raw_whitelight_{plot_exp}.pdf', bbox_inches='tight')
+        plt.close()
+
+    def plot_rectified(self,src,dark,src_dark_flat,flat,src_minus_sky,sky_dark_flat,plot_exp):
+        fig, ax = plt.subplots(3, 2, figsize=(7,7), sharex=True, sharey=True)
+        im = ax[0,0].imshow(np.nanmedian(src, axis=0), aspect='auto')
+        fig.colorbar(im, ax=ax[0,0]); ax[0,0].set_title("Science (rectified)")
+        im = ax[0,1].imshow(np.nanmedian(dark, axis=0), aspect='auto')
+        fig.colorbar(im, ax=ax[0,1]); ax[0,1].set_title("Master dark (rectified)")
+        im = ax[1,0].imshow(np.nanmedian(src_dark_flat, axis=0), aspect='auto')
+        fig.colorbar(im, ax=ax[1,0]); ax[1,0].set_title("Dark+flat corrected")
+        im = ax[1,1].imshow(np.nanmedian(flat, axis=0), aspect='auto')
+        fig.colorbar(im, ax=ax[1,1]); ax[1,1].set_title("Flat (rectified)")
+        im = ax[2,0].imshow(np.nanmedian(src_minus_sky, axis=0), aspect='auto')
+        fig.colorbar(im, ax=ax[2,0]); ax[2,0].set_title("Source - sky (calibrated)")
+        im = ax[2,1].imshow(np.nanmedian(sky_dark_flat, axis=0), aspect='auto')
+        fig.colorbar(im, ax=ax[2,1]); ax[2,1].set_title("Sky (calibrated)")
+        plt.tight_layout()
+        fig.savefig(f'{self.data_path}/figures/rectified_{plot_exp}.pdf', bbox_inches='tight')
+        plt.close()
+
+    def plot_extracted_spetrum(self,wl,fl,err,plot_exp=''):
+        fig = plt.figure(figsize=(6,2.5),dpi=150)
+        plt.plot(wl,fl,lw=0.8)
+        plt.fill_between(wl, fl - err, fl+err, color='gray', alpha=0.3)
+        plt.xlabel('Wavelength [µm]')
+        plt.ylabel('Extracted flux')
+        fig.savefig(f'{self.data_path}/figures/extracted_spectrum_{plot_exp}.pdf', bbox_inches='tight')
+        plt.close()
