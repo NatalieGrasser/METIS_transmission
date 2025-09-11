@@ -3,6 +3,7 @@ import astropy.constants as const
 from astropy import units as u
 from scipy.ndimage import convolve1d
 import pickle
+import pandas as pd
 
 def save_pickle(obj, filename):
     with open(filename, 'wb') as f:
@@ -87,3 +88,31 @@ def instrumental_broadening(wave, flux, resolution=100000, fwhm=None):
     else: # fwhm in km/s
         flux_LSF = IB(fwhm=fwhm, kernel='gaussian')
     return flux_LSF
+
+class PSG_input:
+    def __init__(self,name):
+        self.name = name
+        self.table = self.create_table()
+        self.pressure = self.table['Pressure'].to_numpy()
+        self.temperature = self.table['Temperature'].to_numpy()
+
+    def create_table(self): # convert PSG input file into useable table
+
+        with open(f'./{self.name}_psg_input.txt', "r") as file:
+            lines = file.readlines()
+
+        rows = []
+        for line in lines:
+            if "<ATMOSPHERE-LAYER-" in line:
+                index = line.index(">")
+                rows.append(line[index+1:-1]) # remove \n from end of row
+
+        columns = [ "Pressure", "Temperature", "Altitude", "H2", "He", "H2O", "CH4", "C2H6", "CO2", "C2H2", "C2H4", "CO",
+                    "H2CO", "NH3", "SO2", "H2S", "SO", "CS2", "OCS", "DMS", "C2H6S2"]
+
+        df = pd.DataFrame([row.split(",") for row in rows])
+        df.columns = columns
+        df = df.astype(float) # Convert all columns to float
+        df = df.iloc[::-1] # reverse order, bc pRT reads temps from top to bottom of atmosphere
+
+        return df

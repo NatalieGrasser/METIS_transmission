@@ -2,38 +2,35 @@ import numpy as np
 import astropy.units as u
 import wget
 import os
-from petitRADTRANS.config import petitradtrans_config_parser
-petitradtrans_config_parser.set_input_data_path('/net/lem/data2/pRT3_formatted')
 import pathlib
 from astropy.io import fits
 from astropy.table import QTable
 from utils import *
 import matplotlib.pyplot as plt
-from petitRADTRANS.radtrans import Radtrans
 from petitRADTRANS import physical_constants as cst
+from pRT_model import *
 
 class System:
 
-    def __init__(self,name,exptime):
+    def __init__(self,parameters,plot=False):
 
-        self.name=name
-        self.data_path = os.path.join(os.getcwd(),name)
-        self.exptime = exptime
-        figs_path = pathlib.Path(f'{self.data_path}/figures')
+        self.parameters = parameters
+        self.project_path = parameters['project_path'] 
+        self.exptime = parameters['exptime_per_frame']
+        figs_path = pathlib.Path(f'{self.project_path}/figures')
         figs_path.mkdir(parents=True, exist_ok=True)
 
-        self.R_star = 0.5 * u.R_sun # stellar radius
-        self.d_star = 38 * u.pc # distance to K2-18
-        sma = 0.15*u.au
-        #period = 32.9*u.day
-        period = 10.0*u.day # USE SHORTER PERIOD FOR TESTING -> larger Kp
-        incl = 89.57*u.deg # inclination
-        e = 0.0
+        self.R_star = parameters['R_star']
+        self.d_star = parameters['d_star']
+        sma = parameters['sma']
+        period = parameters['period']
+        incl = parameters['inclination']
+        e = parameters['e']
         self.Kp = ((2*np.pi*sma*np.sin(incl))/(period*np.sqrt(1-e**2))).to(u.km/u.s) # RV semi-amplitude
         #print(f"Kp = {self.Kp:.3f}")
 
         transit_duration = 2.67*u.h
-        num_exp_in_transit = int(transit_duration.to(u.s)/exptime) # number of exposures during transit
+        num_exp_in_transit = int(transit_duration.to(u.s)/self.exptime) # number of exposures during transit
         delta_phase = (transit_duration.to(u.day)/2/period).value # half duration in phase
         self.phase_transit = np.linspace(-delta_phase,delta_phase,num_exp_in_transit) # phase during transit
         self.rv_transit = self.Kp*np.sin(2*np.pi*self.phase_transit)
@@ -42,7 +39,7 @@ class System:
         self.overhead = int(10) # total -> make even number
         self.num_exp = num_exp_in_transit + self.overhead # total number of exposures
         idx = np.arange(self.num_exp)
-        t_offsets = (idx - (self.num_exp - 1)/2.0) * exptime # time offset (in u.s) symmetric around mid-transit t=0
+        t_offsets = (idx - (self.num_exp - 1)/2.0) * self.exptime # time offset (in u.s) symmetric around mid-transit t=0
         t_offsets_days = t_offsets.to(u.day)
         self.phase_obs = (t_offsets_days / period).decompose().value # phase during observation (transit + overhead)
         self.rv_obs = self.Kp * np.sin(2.0 * np.pi * self.phase_obs) 
@@ -59,54 +56,21 @@ class System:
         star_flx_um = instrumental_broadening(star_wl_um.value, star_flx_um.value, resolution=1e5)*star_flx_um.unit
         self.star_flx_interp = np.interp(self.planet_wl_um.value, star_wl_um.value, star_flx_um.value)*star_flx_um.unit
 
+        if plot:
+            figs_dir = pathlib.Path(f'{self.project_path}/figures/input')
+            figs_dir.mkdir(parents=True, exist_ok=True)
+            self.plot_stellar_spectrum()
+            self.plot_planet_transmission()
+
     def get_planet_spectrum(self):
-        planet_spectrum = pathlib.Path(f'{self.data_path}/planet_spectrum.fits')
+        planet_spectrum = pathlib.Path(f'{self.project_path}/pRT_spectra/planet_spectrum.fits')
 
         if planet_spectrum.exists():
             tbl = QTable.read(planet_spectrum)
             planet_wl_um = tbl['wavelength'] # in um
             transit_radii_um = tbl['flux'] # in um
-            transit_radii_cm = (transit_radii_um.to(u.cm)).value
         else:
-            
-            radtrans = Radtrans(
-                pressures=np.logspace(-6, 2, 100),
-                line_species=['H2O','CH4'],
-                rayleigh_species=['H2', 'He'],
-                gas_continuum_contributors=['H2--H2', 'H2--He'],
-                wavelength_boundaries=[2.8,4.2], # microns (L-band)
-                line_opacity_mode='lbl')
-
-            temperatures = 300 * np.ones_like(radtrans.pressures) # radtrans.pressures is in cgs units
-
-            mass_fractions = {
-                'H2': 0.74 * np.ones(temperatures.size),
-                'He': 0.24 * np.ones(temperatures.size),
-                'H2O': 1e-2 * np.ones(temperatures.size),
-                'CH4': 1e-2 * np.ones(temperatures.size)}
-
-            #  2.33 is a typical value for H2-He dominated atmospheres
-            mean_molar_masses = 2.33 * np.ones(temperatures.size)
-            
-            planet_radius = 1.0 * cst.r_jup_mean # FIX PLANET RADIUS
-            reference_gravity = 10 ** 3.5
-            reference_pressure = 0.01
-
-            planet_wl_cm, transit_radii_cm, _ = radtrans.calculate_transit_radii(
-                                                                        temperatures=temperatures,
-                                                                        mass_fractions=mass_fractions,
-                                                                        mean_molar_masses=mean_molar_masses,
-                                                                        reference_gravity=reference_gravity,
-                                                                        planet_radius=planet_radius,
-                                                                        reference_pressure=reference_pressure)
-            
-            transit_radii_cm = instrumental_broadening(planet_wl_cm, transit_radii_cm, resolution=1e5)
-            transit_radii_um = (transit_radii_cm*1e4)*u.um
-            planet_wl_um = (planet_wl_cm*1e4)*u.um
-
-            planet_spectrum = pathlib.Path(f'{self.data_path}/planet_spectrum.fits')
-            tbl = QTable([planet_wl_um, transit_radii_um], names=['wavelength', 'flux'])
-            tbl.write(planet_spectrum, overwrite=True)
+            planet_wl_um, transit_radii_um = pRT_spectrum(self.parameters).make_spectrum(save_as='planet_spectrum')
 
         return planet_wl_um, transit_radii_um
 
@@ -123,9 +87,9 @@ class System:
             
             fname = f'lte{t_val:05d}-{log_g_val:.2f}{sign_specifier}{np.abs(fe_h_val):.1f}.PHOENIX-ACES-AGSS-COND-2011-HiRes.fits'
             fpath = f'ftp://phoenix.astro.physik.uni-goettingen.de/HiResFITS/PHOENIX-ACES-AGSS-COND-2011/Z-0.0/{fname}'
-            savepath = os.path.join(self.data_path, fname)
+            savepath = os.path.join(self.project_path, fname)
             wave_path = 'ftp://phoenix.astro.physik.uni-goettingen.de/HiResFITS/WAVE_PHOENIX-ACES-AGSS-COND-2011.fits'
-            wave_savepath = os.path.join(self.data_path, 'WAVE_PHOENIX-ACES-AGSS-COND-2011.fits')
+            wave_savepath = os.path.join(self.project_path, 'WAVE_PHOENIX-ACES-AGSS-COND-2011.fits')
 
             # Download wavelength grid if missing
             if not os.path.exists(wave_savepath):
@@ -146,7 +110,7 @@ class System:
             mask = (wavelengths >= wl_lims[0]) & (wavelengths <= wl_lims[1])
             return wavelengths[mask], flux_density[mask]
 
-        star_template = pathlib.Path(f'{self.data_path}/M2_star.fits')
+        star_template = pathlib.Path(f'{self.project_path}/M2_star.fits')
         if star_template.exists():
             tbl = QTable.read(star_template)
             star_wl = tbl['wavelength']
@@ -158,7 +122,7 @@ class System:
 
         return star_wl, star_flx
     
-    def get_transit_array(self, wl_obs_range):
+    def get_transit_array(self, wl_obs_range, plot=False):
         """
         Build time-series transit spectra interpolated onto a chosen observed wavelength range.
         """
@@ -212,6 +176,11 @@ class System:
         self.planet_wl_obs_range = planet_wl_obs_range
         self.transit_flux_array = transit_flux_array
 
+        if plot:
+            figs_dir = pathlib.Path(f'{self.project_path}/figures/input')
+            figs_dir.mkdir(parents=True, exist_ok=True)
+            self.plot_transit_timeseries()
+
         return transit_flux_array
     
     def plot_transit_timeseries(self):
@@ -222,7 +191,7 @@ class System:
         plt.colorbar(im)
         ax.set_ylabel(f'Exposures')
         ax.set_xlabel(f'Wavelength [{self.planet_wl_um.unit}]')
-        fig.savefig(f'{self.data_path}/figures/input_transit_timeseries.pdf', bbox_inches='tight')
+        fig.savefig(f'{self.project_path}/figures/input/transit_timeseries.pdf', bbox_inches='tight')
         plt.close()
 
     def plot_stellar_spectrum(self):
@@ -231,7 +200,7 @@ class System:
         plt.legend()
         ax.set_ylabel(f'Flux [{self.star_flx_interp.unit}]')
         ax.set_xlabel(f'Wavelength [{self.planet_wl_um.unit}]')
-        fig.savefig(f'{self.data_path}/figures/stellar_spectrum.pdf', bbox_inches='tight')
+        fig.savefig(f'{self.project_path}/figures/input/stellar_spectrum.pdf', bbox_inches='tight')
         plt.close()
 
     def plot_planet_transmission(self):
@@ -239,5 +208,5 @@ class System:
         ax.plot(self.planet_wl_um, self.transit_radii_cm / cst.r_jup_mean,lw=0.5)
         ax.set_xlabel(f'Wavelength [{self.planet_wl_um.unit}]')
         ax.set_ylabel(r'Transit radius [$\rm R_{Jup}$]')
-        fig.savefig(f'{self.data_path}/figures/planet_spectrum.pdf', bbox_inches='tight')
+        fig.savefig(f'{self.project_path}/figures/input/planet_spectrum.pdf', bbox_inches='tight')
         plt.close()

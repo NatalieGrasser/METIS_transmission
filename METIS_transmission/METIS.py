@@ -14,7 +14,7 @@ class METIS:
 
     def __init__(self,central_wavelength,system_obj):
 
-        self.data_path = system_obj.data_path
+        self.project_path = system_obj.project_path
         self.exptime= system_obj.exptime
         self.planet_wl_obs_range = system_obj.planet_wl_obs_range
         self.cmd = sim.UserCommands(use_instrument="METIS",
@@ -24,8 +24,10 @@ class METIS:
         
     def observe_transit_calib(self,transit_flux_array,output_dir,plot_exp=None):
 
-        self.output_dir = pathlib.Path(f'{self.data_path}/transit/{output_dir}')
+        self.output_dir = pathlib.Path(f'{self.project_path}/METIS_data/{output_dir}')
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.figs_dir = pathlib.Path(f'{self.project_path}/figures/METIS_output')
+        self.figs_dir.mkdir(parents=True, exist_ok=True)
 
         transit_simulated_frames = []
         for i,fl in enumerate(transit_flux_array):
@@ -307,25 +309,7 @@ class METIS:
                 peak_y[i] = np.nanargmax(profile_y)
                 frac_nonzero[i] = np.sum(profile_y > 0.3) / float(len(profile_y))  
 
-            median_bg = np.median(maxvals)
-            #sig_mask = (maxvals > np.maximum(3.0 * np.std(maxvals), median_bg * 1.2))
-            #sig_mask |= (frac_nonzero > signal_frac_thresh)
-            #sig_mask = (maxvals > median_bg * 1.2)
             sig_mask = (maxvals > 0.5) | (frac_nonzero > signal_frac_thresh)
-
-
-            if plot_exp is not None and plot_diagnostics:
-                fig, ax = plt.subplots(2,1,figsize=(5,3), sharex=True)
-                ax[0].plot(maxvals, label='slice max (y profile)', lw=0.8)
-                ax[0].axhline(median_bg, color='k', linestyle=':', label='median')
-                ax[0].legend(fontsize=8)
-                ax[1].plot(frac_nonzero, label='frac_nonzero (y profile)')
-                #ax[1].axhline(signal_frac_thresh, color='r', linestyle='--', label='frac thresh')
-                ax[1].legend(fontsize=8)
-                ax[1].set_xlabel('wavelength index')
-                plt.subplots_adjust(hspace=0)
-                fig.savefig(f'{self.data_path}/figures/extract_yprof_{plot_exp}.pdf', bbox_inches='tight')
-                plt.close()
 
             # 3) fit trace
             good_idxs = np.where(sig_mask)[0]
@@ -349,7 +333,7 @@ class METIS:
                 plt.title('White light with fitted trace (approx mapping)')
                 plt.colorbar(im)
                 plt.legend()
-                fig.savefig(f'{self.data_path}/figures/extract_trace_{plot_exp}.pdf', bbox_inches='tight')
+                fig.savefig(f'{self.project_path}/figures/METIS_output/extract_trace_{plot_exp}.pdf', bbox_inches='tight')
                 plt.close()
 
             # 4) extract spectrum (updated)
@@ -438,7 +422,7 @@ class METIS:
         ax[1,1].set_title("Dark (raw)")
         plt.colorbar(im3,ax=ax[1,1])
         fig.tight_layout()
-        fig.savefig(f'{self.data_path}/figures/raw_whitelight_{plot_exp}.pdf', bbox_inches='tight')
+        fig.savefig(f'{self.project_path}/figures/METIS_output/raw_whitelight_{plot_exp}.pdf', bbox_inches='tight')
         plt.close()
 
     def plot_rectified(self,src,dark,src_dark_flat,flat,src_minus_sky,sky_dark_flat,plot_exp):
@@ -456,7 +440,7 @@ class METIS:
         im = ax[2,1].imshow(np.nanmedian(sky_dark_flat, axis=0), aspect='auto')
         fig.colorbar(im, ax=ax[2,1]); ax[2,1].set_title("Sky (calibrated)")
         plt.tight_layout()
-        fig.savefig(f'{self.data_path}/figures/rectified_{plot_exp}.pdf', bbox_inches='tight')
+        fig.savefig(f'{self.project_path}/figures/METIS_output/rectified_{plot_exp}.pdf', bbox_inches='tight')
         plt.close()
 
     def plot_extracted_spetrum(self,wl,fl,err,plot_exp=''):
@@ -465,5 +449,5 @@ class METIS:
         plt.fill_between(wl, fl - err, fl+err, color='gray', alpha=0.3)
         plt.xlabel('Wavelength [µm]')
         plt.ylabel('Extracted flux')
-        fig.savefig(f'{self.data_path}/figures/extracted_spectrum_{plot_exp}.pdf', bbox_inches='tight')
+        fig.savefig(f'{self.project_path}/figures/METIS_output/extracted_spectrum_{plot_exp}.pdf', bbox_inches='tight')
         plt.close()
