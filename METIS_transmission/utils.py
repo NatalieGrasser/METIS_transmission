@@ -108,7 +108,7 @@ class PSG_input:
                 rows.append(line[index+1:-1]) # remove \n from end of row
 
         columns = [ "Pressure", "Temperature", "Altitude", "H2", "He", "H2O", "CH4", "C2H6", "CO2", "C2H2", "C2H4", "CO",
-                    "H2CO", "NH3", "SO2", "H2S", "SO", "CS2", "OCS", "DMS", "C2H6S2"]
+                    "H2CO", "NH3", "SO2", "H2S", "SO", "CS2", "OCS", "C2H6S", "C2H6S2"]
 
         df = pd.DataFrame([row.split(",") for row in rows])
         df.columns = columns

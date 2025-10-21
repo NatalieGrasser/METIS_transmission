@@ -17,7 +17,7 @@ class System:
         self.parameters = parameters
         self.project_path = parameters['project_path'] 
         self.exptime = parameters['exptime_per_frame']
-        figs_path = pathlib.Path(f'{self.project_path}/figures')
+        figs_path = pathlib.Path(f'{self.project_path}/figures/input')
         figs_path.mkdir(parents=True, exist_ok=True)
 
         self.R_star = parameters['R_star']
@@ -27,7 +27,7 @@ class System:
         incl = parameters['inclination']
         e = parameters['e']
         self.Kp = ((2*np.pi*sma*np.sin(incl))/(period*np.sqrt(1-e**2))).to(u.km/u.s) # RV semi-amplitude
-        #print(f"Kp = {self.Kp:.3f}")
+        print(f"Kp = {self.Kp:.3f}")
 
         transit_duration = 2.67*u.h
         num_exp_in_transit = int(transit_duration.to(u.s)/self.exptime) # number of exposures during transit
@@ -36,8 +36,10 @@ class System:
         self.rv_transit = self.Kp*np.sin(2*np.pi*self.phase_transit)
         #print(f"RV at ingress/egress: +/- {np.max(self.rv_transit):.3f}")
 
-        self.overhead = int(10) # total -> make even number
+        self.overhead = int(10) # total -> choose even number
         self.num_exp = num_exp_in_transit + self.overhead # total number of exposures
+        print(f'{self.num_exp} exposures of {self.exptime} each = {self.num_exp*self.exptime}')
+        print(f'Transit duration = {transit_duration.to(u.s)}')
         idx = np.arange(self.num_exp)
         t_offsets = (idx - (self.num_exp - 1)/2.0) * self.exptime # time offset (in u.s) symmetric around mid-transit t=0
         t_offsets_days = t_offsets.to(u.day)
@@ -70,11 +72,17 @@ class System:
             planet_wl_um = tbl['wavelength'] # in um
             transit_radii_um = tbl['flux'] # in um
         else:
-            planet_wl_um, transit_radii_um = pRT_spectrum(self.parameters).make_spectrum(save_as='planet_spectrum')
+            pRT_model_object = pRT_spectrum(self.parameters)
+            planet_wl_um, transit_radii_um = pRT_model_object.make_spectrum(save_as='planet_spectrum')
+            pRT_model_object.plot_opacities()
+            pRT_model_object.plot_opacity_contr()
 
         return planet_wl_um, transit_radii_um
 
     def get_stellar_spectrum(self):
+
+        phoenix_folder = pathlib.Path(f'{os.getcwd()}/star')
+        phoenix_folder.mkdir(parents=True, exist_ok=True)
 
         def get_PHOENIX_model(temperature, log_g, fe_h=0, wl_lims=[0.5*u.micron, 3*u.micron]):
             if isinstance(temperature, u.Quantity):
@@ -87,9 +95,9 @@ class System:
             
             fname = f'lte{t_val:05d}-{log_g_val:.2f}{sign_specifier}{np.abs(fe_h_val):.1f}.PHOENIX-ACES-AGSS-COND-2011-HiRes.fits'
             fpath = f'ftp://phoenix.astro.physik.uni-goettingen.de/HiResFITS/PHOENIX-ACES-AGSS-COND-2011/Z-0.0/{fname}'
-            savepath = os.path.join(self.project_path, fname)
+            savepath = os.path.join(phoenix_folder, fname)
             wave_path = 'ftp://phoenix.astro.physik.uni-goettingen.de/HiResFITS/WAVE_PHOENIX-ACES-AGSS-COND-2011.fits'
-            wave_savepath = os.path.join(self.project_path, 'WAVE_PHOENIX-ACES-AGSS-COND-2011.fits')
+            wave_savepath = os.path.join(phoenix_folder, 'WAVE_PHOENIX-ACES-AGSS-COND-2011.fits')
 
             # Download wavelength grid if missing
             if not os.path.exists(wave_savepath):
@@ -110,7 +118,7 @@ class System:
             mask = (wavelengths >= wl_lims[0]) & (wavelengths <= wl_lims[1])
             return wavelengths[mask], flux_density[mask]
 
-        star_template = pathlib.Path(f'{self.project_path}/M2_star.fits')
+        star_template = pathlib.Path(f'{phoenix_folder}/M2_star.fits')
         if star_template.exists():
             tbl = QTable.read(star_template)
             star_wl = tbl['wavelength']
@@ -181,6 +189,7 @@ class System:
             figs_dir.mkdir(parents=True, exist_ok=True)
             self.plot_transit_timeseries()
 
+        print('\nTransit flux array ready.\n')
         return transit_flux_array
     
     def plot_transit_timeseries(self):

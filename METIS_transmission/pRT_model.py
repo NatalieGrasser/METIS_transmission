@@ -6,13 +6,14 @@ import os
 from utils import *
 from petitRADTRANS.radtrans import Radtrans
 import pathlib
-from astropy.io import fits
+import matplotlib.pyplot as plt
 from astropy.table import QTable
+from PyAstronomy.pyasl import fastRotBroad
+from petitRADTRANS.plotlib import plot_radtrans_opacities
+from petitRADTRANS.plotlib import plot_opacity_contributions
 
 import getpass
 if getpass.getuser() == "grasser": # when runnig from LEM
-    import matplotlib
-    matplotlib.use('Agg') # disable interactive plotting
     fastchem_tables = '/net/lem/data2/regt/fastchem_tables'
 elif getpass.getuser() == "natalie": # when testing from my laptop
     fastchem_tables = '/home/natalie/fastchem_tables'
@@ -28,6 +29,7 @@ class pRT_spectrum:
         self.n_atm_layers = len(self.pressure)
         temp = parameters['temperature']
         self.temperature = np.array(temp) if not np.isscalar(temp) else temp * np.ones(self.n_atm_layers)
+        self.ref_pressure = 0.1 # what is this exactly?
         
         self.species_info = pd.read_csv('species_info.csv', index_col=0)
         #self.species_names = [k.replace("log_", "") for k in parameters.keys() 
@@ -40,7 +42,7 @@ class pRT_spectrum:
         self.wave_range = parameters['pRT_wave_range_um']
 
         if self.params['chemistry']=='equ': # use equilibium chemistry
-            self.mass_fractions = self.equ_chemistry(self.species_pRT,self.params)
+            self.mass_fractions = self.equ_chemistry(self.species_pRT,self.species_hill,self.params)
 
         elif self.params['chemistry']=='free': # use free chemistry with defined VMRs
             self.mass_fractions, self.CO, self.FeH = self.free_chemistry(self.species_pRT,self.params)
@@ -100,8 +102,10 @@ class pRT_spectrum:
 
         return mass_fractions
         
-    def equ_chemistry(self,species_pRT,params):
+    def equ_chemistry(self,species_pRT,species_hill,params):
         species_info = pd.read_csv(os.path.join('species_info.csv'))
+        species_pRT.extend(s for s in ['H2','He'] if s not in species_pRT)
+        species_hill.extend(s for s in ['H2','He'] if s not in species_hill)
 
         def load_interp_tables():
             import h5py
@@ -118,7 +122,7 @@ class pRT_spectrum:
 
             from scipy.interpolate import RegularGridInterpolator
             self.interp_tables = {}
-            for species_i, hill_i in zip([*species_pRT, 'MMW'], [*self.species_hill, 'MMW']):
+            for species_i, hill_i in zip([*species_pRT, 'MMW'], [*species_hill, 'MMW']):
                 key = 'MMW' if species_i=='MMW' else 'log_VMR'
                 arr = load_hdf5(f'{hill_i}.hdf5', key=key)  # Load equchem abundance tables
                 
@@ -130,7 +134,6 @@ class pRT_spectrum:
                 
         def get_VMRs(ParamTable):
             self.VMRs = {}
-            self.VMRs = {'He':0.15*np.ones(self.n_atm_layers)}
 
             def apply_bounds(val, grid):
                 val=np.array(val)
@@ -163,7 +166,6 @@ class pRT_spectrum:
 
         load_interp_tables()
         self.VMRs = get_VMRs(params)
-        self.VMRs = self.get_H2(self.VMRs)
         self.mass_fractions = self.VMR_to_MF(self.VMRs)
 
         return self.mass_fractions
@@ -219,7 +221,10 @@ class pRT_spectrum:
         return mass_fractions, CO, FeH
 
     def make_spectrum(self, save_as=None):
-        radtrans = Radtrans(
+
+        self.species_pRT = [self.species_pRT] if not isinstance(self.species_pRT, list) else self.species_pRT
+
+        self.radtrans = Radtrans(
                 pressures=self.pressure,
                 line_species=self.species_pRT,
                 rayleigh_species=['H2', 'He'],
@@ -228,16 +233,22 @@ class pRT_spectrum:
                 line_opacity_mode='lbl')
     
         
-        planet_wl_cm, transit_radii_cm, _ = radtrans.calculate_transit_radii(temperatures=self.temperature,
+        planet_wl_cm, transit_radii_cm, _ = self.radtrans.calculate_transit_radii(temperatures=self.temperature,
                                                                         mass_fractions=self.mass_fractions,
                                                                         mean_molar_masses=self.MMW,
                                                                         reference_gravity=self.gravity,
                                                                         planet_radius=self.planet_radius,
-                                                                        reference_pressure=0.01)
+                                                                        reference_pressure=self.ref_pressure)
+        
+        if 'vsini' in self.params:
+            planet_wl_cm = np.linspace(np.min(planet_wl_cm), np.max(planet_wl_cm), planet_wl_cm.size)
+            epsilon_limb = self.params.get('epsilon_limb', 0.5)
+            transit_radii_cm = fastRotBroad(planet_wl_cm, transit_radii_cm, epsilon_limb, self.params['vsini'].value) 
         
         transit_radii_cm = instrumental_broadening(planet_wl_cm, transit_radii_cm, resolution=1e5)
-        transit_radii_um = (transit_radii_cm*1e4)*u.um
-        planet_wl_um = (planet_wl_cm*1e4)*u.um
+        n_clip = 100 # clip weird edges from fastRotBroad
+        transit_radii_um = (transit_radii_cm[n_clip:-n_clip]*1e4)*u.um
+        planet_wl_um = (planet_wl_cm[n_clip:-n_clip]*1e4)*u.um
 
         if save_as is not None:
             output_dir = pathlib.Path(f'{self.project_path}/pRT_spectra')
@@ -247,3 +258,83 @@ class pRT_spectrum:
             tbl.write(planet_spectrum, overwrite=True)
 
         return planet_wl_um, transit_radii_um
+    
+    def plot_opacities(self,line_species=None,wave_range_um=None,ylim=None):
+
+        temp = np.median(self.temperature) if not np.isscalar(self.temperature) else self.temperature
+        if line_species is None:
+            line_species = [x for x in self.species_names if x not in ['H2','He']]
+        line_species = list(line_species) if isinstance(line_species, list)==False else line_species
+        for spec in line_species:
+            color = self.species_info.loc[spec,'color']
+            plot_radtrans_opacities(self.radtrans, [spec],
+                                 temperature=temp,pressure_bar=0.1,lw=0.5,c=color)
+        plt.yscale('log')
+        if ylim is None:
+            plt.ylim([1e-10,1e10])
+        else:
+            plt.xlim(ylim[0],ylim[1])
+        plt.xlim(self.wave_range[0],self.wave_range[1])
+        plt.ylabel('Opacity (cm$^2$ g$^{-1}$)')
+        plt.xlabel('Wavelength (micron)')
+        plt.legend()
+        fig = plt.gcf()
+        fig.set_size_inches(7, 4)
+        if wave_range_um is not None:
+            plt.xlim(wave_range_um[0],wave_range_um[1])
+        else:
+            plt.xlim(self.wave_range[0],self.wave_range[1])
+        fig.tight_layout()
+        plt.savefig(f'{self.project_path}/figures/input/opacities.pdf',dpi=200)
+
+    def plot_opacity_contr(self,species=None,wave_range_um=[],include_total=False):
+
+        common_params = {'mode': 'transmission',
+                        'temperatures': self.temperature,
+                        'mass_fractions': self.mass_fractions,
+                        'mean_molar_masses': self.MMW,
+                        'reference_gravity': self.gravity,
+                        'planet_radius': self.planet_radius,
+                        'reference_pressure': self.ref_pressure}
+
+        opacity_contributions = self.radtrans.calculate_contribution_spectra(**common_params)
+        if species is None:
+            species = self.species_names
+
+        include_contributions = []
+        if include_total:
+            include_contributions.append('Total')
+        if 'H2' in species and 'He' in species:
+            include_contributions.extend(['H2 (Rayleigh)', 'He (Rayleigh)', 'H2--H2','H2--He'])
+
+        line_species_colors = {}
+        rayleigh_species_colors = {}
+        for spec in species:
+            include_contributions.append(spec)
+            if spec in ['H2','He']:
+                rayleigh_species_colors[spec] = self.species_info.loc[spec,'color']
+            else:
+                line_species_colors[spec] = self.species_info.loc[spec,'color']
+        
+        _ = plot_opacity_contributions(
+                self.radtrans,
+                include=include_contributions,
+                colors={'Total': 'k',
+                    'line_species': line_species_colors,
+                    'rayleigh_species': rayleigh_species_colors},
+                line_styles={'Total': '-.',
+                    'line_species': ':',
+                    'rayleigh_species': '--'},
+                opacity_contributions=opacity_contributions,
+                fill_below=True,
+                #x_axis_scale='log',
+                **common_params)
+        
+        fig = plt.gcf()
+        fig.set_size_inches(7, 4)
+        if wave_range_um!=[]:
+            plt.xlim(wave_range_um[0]*1e-6,wave_range_um[1]*1e-6) # [m]
+        else:
+            plt.xlim(self.wave_range[0]*1e-6,self.wave_range[1]*1e-6) # [m]
+        fig.tight_layout()    
+        plt.savefig(f'{self.project_path}/figures/input/opacity_contributions.pdf',dpi=200)

@@ -12,7 +12,7 @@ from scipy.ndimage import gaussian_filter
 
 class METIS:
 
-    def __init__(self,central_wavelength,system_obj):
+    def __init__(self,central_wavelength,system_obj,order):
 
         self.project_path = system_obj.project_path
         self.exptime= system_obj.exptime
@@ -21,13 +21,31 @@ class METIS:
                        set_modes=["lms"],
                        properties={"!OBS.wavelen": central_wavelength})
         self.metis = sim.OpticalTrain(self.cmd)
-        
-    def observe_transit_calib(self,transit_flux_array,output_dir,plot_exp=None):
+        self.transit_flux_array = system_obj.transit_flux_array
 
-        self.output_dir = pathlib.Path(f'{self.project_path}/METIS_data/{output_dir}')
+        self.order = order
+        self.output_dir = pathlib.Path(f'{self.project_path}/METIS_data/order{order}')
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.figs_dir = pathlib.Path(f'{self.project_path}/figures/METIS_output')
         self.figs_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_observations(self,plot_exp=None):
+
+        timeseries_extracted = pathlib.Path(f'{self.output_dir}/timeseries_{self.order}.npz')
+        if timeseries_extracted.exists():
+            data = np.load(timeseries_extracted)
+            wl  = data["wl"]
+            fl  = data["fl"]
+            err = data["err"]
+        else:
+            transit, dark, flat, sky = self.observe_transit_calib(self.transit_flux_array,plot_exp=plot_exp)
+            wl, fl, err = self.rectify_calibrate_extract(transit, dark, flat, sky, plot_exp=plot_exp)
+            np.savez(timeseries_extracted, wl=wl, fl=fl, err=err)
+        return wl, fl, err
+        
+    def observe_transit_calib(self,transit_flux_array,plot_exp=None):
+
+        print(f'\n *** Generating observations... *** \n')
 
         transit_simulated_frames = []
         for i,fl in enumerate(transit_flux_array):
@@ -149,11 +167,14 @@ class METIS:
             self.plot_raw_whitelight(transit_simulated_frames[plot_exp],master_flat_hdul,
                                      master_dark_hdul,hdul_sky,plot_exp=plot_exp)
 
+        print(f'\n *** Observations ready. *** \n')
         return transit_simulated_frames, master_dark_hdul, master_flat_hdul, hdul_sky
     
     def rectify_calibrate_extract(self, 
                                   transit_simulated_frames, master_dark_hdul, 
                                   master_flat_hdul, hdul_sky, plot_exp=None):
+        
+        print(f'\n *** Calibrating observations... *** \n')
 
         def get_rectified(target,hdul_raw):
             rect_path = pathlib.Path(f'{self.output_dir}/rectified_{target}.fits')
@@ -398,6 +419,7 @@ class METIS:
             self.plot_extracted_spetrum(wl_obs,fluxes_obs[plot_exp],
                                         err_obs[plot_exp],plot_exp=plot_exp)
 
+        print(f'\n *** Observations calibrated. *** \n')
         return wl_obs, fluxes_obs, err_obs
 
     def plot_raw_whitelight(self,hdul_src,master_flat_hdul,master_dark_hdul,hdul_sky,plot_exp=''):
