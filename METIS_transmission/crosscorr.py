@@ -13,7 +13,7 @@ from pRT_model import *
 class CrossCorr:
 
     def __init__(self, system_obj, wave, flux, err, outlier_sigma=3, 
-                 systrem_iter=3, plot_order=None, template=None):
+                 sysrem_iter=2, plot_order=None, template=None):
 
         inherit_attributes = ['project_path','delta_lambda','phase_obs','in_transit',
                               'planet_wl_um','Kp','rv_transit','phase_transit',
@@ -22,21 +22,32 @@ class CrossCorr:
         for attr in inherit_attributes:  # list of attributes to pass down
             setattr(self, attr, getattr(system_obj, attr))
 
-        n_exp, n_orders, n_wl  = flux.shape
-        self.figs_dir = pathlib.Path(f'{self.project_path}/figures/crosscorr')
+        self.vbary = self.parameters['vbary']
+        self.vsys = self.parameters['vsys']
+
+        n_exp = len(flux)
+        n_orders = len(flux[0])
+        test_on_input = system_obj.parameters['test_on_input']
+        if test_on_input:
+            self.figs_dir = pathlib.Path(f'{self.project_path}/figures/crosscorr_input')
+        else:
+            self.figs_dir = pathlib.Path(f'{self.project_path}/figures/crosscorr')
         self.figs_dir.mkdir(parents=True, exist_ok=True)
 
-        def mask_absorption_emission(spec,specerr,lowerlim=0.7,upperlim=1.2):
+
+        def mask_absorption_emission(spec,specerr,lowerlim=0.7,upperlim=None):
             flux_out = np.copy(spec)
             fluxerr_out=np.copy(specerr)
             for exp in range(n_exp):
                 for order in range(n_orders):
-                    fl=flux_out[exp,order]
-                    flerr=fluxerr_out[exp,order]
+                    fl=flux_out[exp][order]
                     flux_norm = fl/np.nanmedian(fl) #normalized spectrum
-                    goodpix = ((flux_norm>lowerlim)&(flux_norm<upperlim))
-                    flux_out[exp,order][~goodpix] = np.nan
-                    fluxerr_out[exp,order][~goodpix] = np.inf            
+                    if upperlim is None:
+                        goodpix = (flux_norm>lowerlim)
+                    else:
+                        goodpix = ((flux_norm>lowerlim)&(flux_norm<upperlim))
+                    flux_out[exp][order][~goodpix] = np.nan
+                    fluxerr_out[exp][order][~goodpix] = np.inf            
             return flux_out,fluxerr_out
 
         def remove_continuum(wave, spec, err=None, poly_order=3, get_cont=False):
@@ -45,13 +56,9 @@ class CrossCorr:
             if err is None:
                 return_only_flux = True
                 err = np.ones_like(spec)
-
-            wave = np.asarray(wave.value if isinstance(wave, u.Quantity) else wave, dtype=float)
-            spec = np.asarray(spec.value if isinstance(spec, u.Quantity) else spec, dtype=float)
-            err  = np.asarray(err.value  if isinstance(err, u.Quantity)  else err,  dtype=float)
-            nans = np.isnan(spec)
-
-            if spec.ndim == 1: # for template
+            
+            if np.ndim(spec) == 1:
+                nans = np.isnan(spec)
                 continuum = np.poly1d(np.polyfit(wave[~nans],spec[~nans],poly_order))(wave)
                 flux_contrem = spec / continuum
                 err_contrem = err / continuum
@@ -59,22 +66,27 @@ class CrossCorr:
                     return flux_contrem
                 return (flux_contrem, err_contrem, continuum) if get_cont else (flux_contrem, err_contrem)
 
-            elif spec.ndim == 3: 
-                n_exp, n_orders, n_wave = spec.shape
-                flux_contrem = np.full(spec.shape,np.nan)
-                err_contrem=np.full(spec.shape,np.inf)
-                continua=np.full(spec.shape,np.nan)
+            else: # 3D flux
+                flux_contrem = np.full((n_exp,n_orders),np.nan,dtype=object)
+                err_contrem=np.full((n_exp,n_orders),np.inf,dtype=object)
+                continua=np.full((n_exp,n_orders),np.nan,dtype=object)
                 for exp in range(n_exp):
                     for order in range(n_orders):
-                        fl=spec[exp,order]
-                        flerr=err[exp,order]
+                        fl=spec[exp][order]
+                        flerr=err[exp][order]
                         wl=wave[order]
                         nans = np.isnan(fl)
                         continuum_model = np.poly1d(np.polyfit(wl[~nans],fl[~nans],poly_order))
                         continuum = continuum_model(wl)
-                        flux_contrem[exp,order][~nans] = fl[~nans]/continuum[~nans]
-                        err_contrem[exp,order][~nans] = flerr[~nans]/continuum[~nans]
-                        continua[exp,order] = continuum        
+
+                        # Replace scalar NaN with a copy of the original spectrum before masking
+                        flux_contrem[exp][order] = fl.copy()*np.nan
+                        err_contrem[exp][order] = flerr.copy()*np.nan
+                        continua[exp][order] = continuum*np.nan
+
+                        flux_contrem[exp][order][~nans] = fl[~nans]/continuum[~nans]
+                        err_contrem[exp][order][~nans] = flerr[~nans]/continuum[~nans]
+                        continua[exp][order] = continuum   
 
                 return (flux_contrem, err_contrem, continua) if get_cont else (flux_contrem, err_contrem)
 
@@ -83,27 +95,27 @@ class CrossCorr:
             err_out=np.copy(specerr)
             for exp in range(n_exp):
                 for order in range(n_orders):
-                    fl=flux_out[exp,order]
+                    fl=flux_out[exp][order]
                     std = np.nanstd(fl)
                     mean = np.nanmedian(fl)
                     outliers = (np.abs(fl-mean)/std)>sigma
-                    flux_out[exp,order][outliers] = np.nan
-                    err_out[exp,order][outliers] = np.inf
+                    flux_out[exp][order][outliers] = np.nan
+                    err_out[exp][order][outliers] = np.inf
             return flux_out,err_out
 
         flux_contrem, err_contrem = remove_continuum(wave, flux, err)
         # mask tellurics after removing continuum bc flux slope is too strong
-        flux_mask0,err_mask0 = mask_absorption_emission(flux_contrem,err_contrem,lowerlim=0.7,upperlim=np.nanmax(flux_contrem))
+        flux_mask0,err_mask0 = mask_absorption_emission(flux_contrem,err_contrem,lowerlim=0.7)
         flux_mask1,err_mask1 = mask_outliers(flux_mask0,err_mask0,sigma=outlier_sigma)
 
-        flux_off_transit_avg = np.zeros_like(flux[0,:])
+        flux_off_transit_avg = np.empty((n_orders),dtype=object)#np.zeros_like(flux[0,:])
         for order in range(n_orders):
-            off_transit_sum = np.zeros_like(flux[0,0])
+            off_transit_sum = np.zeros(len(flux[0][order])) #np.zeros_like(flux[0,0])
             for exp in range(n_exp):
                 if exp in self.in_transit:
                     pass
                 else:
-                    fl=flux_mask1[exp,order]
+                    fl=flux_mask1[exp][order]
                     off_transit_sum +=fl
             off_transit_avg= off_transit_sum/np.nanmedian(off_transit_sum)
             flux_off_transit_avg[order]=off_transit_avg
@@ -112,15 +124,20 @@ class CrossCorr:
         fluxerr_avgrem=np.zeros_like(flux_contrem)
         for order in range(n_orders):
             for exp in range(n_exp):
-                flux_avgrem[exp,order] = flux_mask1[exp,order]/flux_off_transit_avg[order]
-                fluxerr_avgrem[exp,order] = err_mask1[exp,order]/flux_off_transit_avg[order]
+                flux_avgrem[exp][order] = flux_mask1[exp][order]/flux_off_transit_avg[order]
+                fluxerr_avgrem[exp][order] = err_mask1[exp][order]/flux_off_transit_avg[order]
 
-        def sysrem(flux,fluxerr,num_modes=systrem_iter):
+        def sysrem(flux,fluxerr,num_modes=sysrem_iter):
 
+            if flux.dtype==object:
+                flux = np.vstack(flux)
+                fluxerr = np.vstack(fluxerr)
+            
             #flux= (flux.T-np.nanmean(flux, axis=1)).T # shift mean to zero
             max_iterations_per_mode=1000
             a = np.ones(flux.shape[0]) # number of exposures
             residuals=np.copy(flux)
+
             for i in range(num_modes):
                 correction = np.zeros_like(residuals)
                 for j in range(max_iterations_per_mode):
@@ -135,12 +152,13 @@ class CrossCorr:
 
             return residuals    
 
-        flux_sysrem=np.zeros((n_exp,n_orders,n_wl))
-        for i in range(n_orders): 
-            fl=flux_avgrem[:,i]
-            flerr=fluxerr_avgrem[:,i]
+        flux_sysrem=np.zeros((n_exp,n_orders),dtype=object)
+        for ord in range(n_orders): 
+            fl=flux_avgrem[:,ord]
+            flerr=fluxerr_avgrem[:,ord]
             fl_new=sysrem(fl,flerr)
-            flux_sysrem[:,i]=fl_new
+            for exp in range(n_exp): # required for inhomogeneous object
+                flux_sysrem[exp,ord] = fl_new[exp]
 
         # one last outlier flagging before crosscorr
         flux_mask2,fluxerr_mask2 =mask_outliers(flux_sysrem,fluxerr_avgrem,sigma=3)
@@ -178,6 +196,11 @@ class CrossCorr:
             wl=wave[order] # wavelengths are same per exposure
             fl=np.copy(flux_mask2[:,order]) # get all exposures per order
             flerr=np.copy(fluxerr_mask2[:,order])
+
+            if fl.dtype==object: # all within same order have same length
+                fl = np.vstack(fl)
+                flerr = np.vstack(flerr)
+
             bad_pixels = ~np.isfinite(fl) | ~np.isfinite(flerr)
             fl[bad_pixels] = 0
             flerr[bad_pixels] = np.inf
@@ -188,7 +211,7 @@ class CrossCorr:
             template_shift = template_shift - np.mean(template_shift, axis=0) # simplified continuum removal
             self.CCF[:,order] = (fl/flerr**2).dot(template_shift.T) #error weighted
 
-        self.Kp_list = np.arange(0,300,1)#km/s
+        self.Kp_list = np.arange(0,100,1)#km/s
         self.vsys_list=np.arange(-100,101,1) #km/s system velocities we want to shift to
 
         def shift_and_sum(ccf,vsys_list,rv_list):
@@ -205,7 +228,7 @@ class CrossCorr:
         def get_Kp_vsys_map(CCFs):
             CCF_tot = np.zeros((len(self.Kp_list),len(self.vsys_list)))
             for ikp in range(len(self.Kp_list)):
-                rv_list = self.Kp_list[ikp]*np.sin(2*np.pi*self.phase_obs) #calc planet rv for different Kp values
+                rv_list = -self.vbary+self.vsys+self.Kp_list[ikp]*np.sin(2*np.pi*self.phase_obs) #calc planet rv for different Kp values
                 CCF_tot[ikp] = shift_and_sum(CCFs,self.vsys_list,rv_list)
             return CCF_tot    
 
@@ -222,17 +245,23 @@ class CrossCorr:
         self.SNR_planet = self.Kp_vsys_map[Kp_idx,vsys_idx]
 
         if plot_order is not None:
-            self.plot_calib_steps(wave,flux,flux_contrem,flux_avgrem,flux_sysrem,plot_order)
-            self.plot_CCF(plot_order=0)
+            if plot_order=='all':
+                for order in range(6):
+                    self.plot_calib_steps(wave,flux,flux_contrem,flux_avgrem,flux_sysrem,order)
+            else:
+                self.plot_calib_steps(wave,flux,flux_contrem,flux_avgrem,flux_sysrem,plot_order)
+            self.plot_CCF(plot_order=plot_order)
             self.plot_Kp_vsys()
 
     def plot_calib_steps(self,wl,fl_orig,fl_contrem,fl_avgrem,fl_sysrem,plot_order):
 
         fig,(ax1,ax2,ax3,ax4)=plt.subplots(4,1,figsize=(7,6),dpi=200,sharex=True)
-        extent=[np.min(wl),np.max(wl),0,fl_orig.shape[0]]
+        extent=[np.min(wl[plot_order]),np.max(wl[plot_order]),0,fl_orig.shape[0]]
 
         def imshow(ax,arr,title,vmin=0.5,vmax=99.5):
-            slice_ = arr[:,plot_order,:]
+            slice_ = arr[:,plot_order]
+            if slice_.dtype==object:
+                slice_ = np.vstack(slice_)
             im=ax.imshow(slice_,aspect='auto', origin ='lower',extent=extent,
                         vmin=np.nanpercentile(slice_, vmin), vmax=np.nanpercentile(slice_, vmax))
             fig.colorbar(im,ax=ax)
@@ -245,11 +274,12 @@ class CrossCorr:
 
         ax4.set_xlabel('Wavelength [um]')
         fig.tight_layout()
-        fig.savefig(f'{self.figs_dir}/calib_steps.pdf', bbox_inches='tight')
+        fig.savefig(f'{self.figs_dir}/calib_steps_{plot_order}.pdf', bbox_inches='tight')
         plt.close()
 
     def plot_CCF(self,plot_order):
-        xmin, xmax = -30,30
+        pm = 20
+        xmin, xmax = min(self.rv_transit.value)-pm, max(self.rv_transit.value)+pm
         fig = plt.figure(figsize=(5,3),dpi=150)
         im = plt.imshow(self.CCF[:,plot_order,:],origin="lower",aspect='auto',
                 extent=[np.min(self.RVs),np.max(self.RVs),np.min(self.phase_obs),np.max(self.phase_obs)])

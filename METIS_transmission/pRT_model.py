@@ -7,10 +7,12 @@ from utils import *
 from petitRADTRANS.radtrans import Radtrans
 import pathlib
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from astropy.table import QTable
 from PyAstronomy.pyasl import fastRotBroad
 from petitRADTRANS.plotlib import plot_radtrans_opacities
 from petitRADTRANS.plotlib import plot_opacity_contributions
+from astropy import constants as const
 
 import getpass
 if getpass.getuser() == "grasser": # when runnig from LEM
@@ -224,11 +226,19 @@ class pRT_spectrum:
 
         self.species_pRT = [self.species_pRT] if not isinstance(self.species_pRT, list) else self.species_pRT
 
+        CIA =  ['H2--H2','H2--He']
+                #'CH4--CH4','CH4--He','CO2--CH4',
+                #,'CO2--H2','CO2--He','H2--CH4','H2O--H2O']
+        if 'H2O' in self.species_pRT:
+            CIA.append('H2O--H2O')
+        if 'CO2' in self.species_pRT:
+            CIA.append('CO2--CO2')
+
         self.radtrans = Radtrans(
                 pressures=self.pressure,
                 line_species=self.species_pRT,
                 rayleigh_species=['H2', 'He'],
-                gas_continuum_contributors=['H2--H2', 'H2--He'],
+                gas_continuum_contributors=CIA,
                 wavelength_boundaries=[self.wave_range[0],self.wave_range[1]], # microns (L-band)
                 line_opacity_mode='lbl')
     
@@ -239,6 +249,9 @@ class pRT_spectrum:
                                                                         reference_gravity=self.gravity,
                                                                         planet_radius=self.planet_radius,
                                                                         reference_pressure=self.ref_pressure)
+        
+        wl_shifted= planet_wl_cm*(1.0+(self.params['vsys']-self.params['vbary'])/const.c.to('km/s').value)
+        transit_radii_cm = np.interp(planet_wl_cm, wl_shifted, transit_radii_cm)
         
         if 'vsini' in self.params:
             planet_wl_cm = np.linspace(np.min(planet_wl_cm), np.max(planet_wl_cm), planet_wl_cm.size)
@@ -265,29 +278,35 @@ class pRT_spectrum:
         if line_species is None:
             line_species = [x for x in self.species_names if x not in ['H2','He']]
         line_species = list(line_species) if isinstance(line_species, list)==False else line_species
+        legend_lines = []
         for spec in line_species:
-            color = self.species_info.loc[spec,'color']
+            col = self.species_info.loc[spec,'color']
+            mathtext = self.species_info.loc[spec,'mathtext_name']
+            legend_lines.append(Line2D([0], [0], color=col,linewidth=2,label=mathtext))
             plot_radtrans_opacities(self.radtrans, [spec],
-                                 temperature=temp,pressure_bar=0.1,lw=0.5,c=color)
+                                 temperature=temp,pressure_bar=0.1,lw=0.3,c=col)
+            
+        ncol=int(len(line_species)//3) if len(line_species)>2 else 1
+        plt.legend(handles=legend_lines,ncol=ncol,loc='upper center',fontsize=7)
         plt.yscale('log')
         if ylim is None:
             plt.ylim([1e-10,1e10])
         else:
-            plt.xlim(ylim[0],ylim[1])
-        plt.xlim(self.wave_range[0],self.wave_range[1])
+            plt.ylim(ylim[0],ylim[1])
         plt.ylabel('Opacity (cm$^2$ g$^{-1}$)')
         plt.xlabel('Wavelength (micron)')
-        plt.legend()
         fig = plt.gcf()
-        fig.set_size_inches(7, 4)
+        fig.set_size_inches(6, 4)
         if wave_range_um is not None:
             plt.xlim(wave_range_um[0],wave_range_um[1])
         else:
-            plt.xlim(self.wave_range[0],self.wave_range[1])
+            #plt.xlim(self.wave_range[0],self.wave_range[1])
+            plt.xlim(self.params['METIS_wave_range_um'][0],self.params['METIS_wave_range_um'][1])
         fig.tight_layout()
         plt.savefig(f'{self.project_path}/figures/input/opacities.pdf',dpi=200)
+        plt.close()
 
-    def plot_opacity_contr(self,species=None,wave_range_um=[],include_total=False):
+    def plot_opacity_contr(self,species=None,wave_range_um=[],include_total=False,include_cont_species=False):
 
         common_params = {'mode': 'transmission',
                         'temperatures': self.temperature,
@@ -304,7 +323,7 @@ class pRT_spectrum:
         include_contributions = []
         if include_total:
             include_contributions.append('Total')
-        if 'H2' in species and 'He' in species:
+        if 'H2' in species and 'He' in species and include_cont_species:
             include_contributions.extend(['H2 (Rayleigh)', 'He (Rayleigh)', 'H2--H2','H2--He'])
 
         line_species_colors = {}
@@ -322,8 +341,8 @@ class pRT_spectrum:
                 colors={'Total': 'k',
                     'line_species': line_species_colors,
                     'rayleigh_species': rayleigh_species_colors},
-                line_styles={'Total': '-.',
-                    'line_species': ':',
+                line_styles={'Total': ':',
+                    'line_species': '-',
                     'rayleigh_species': '--'},
                 opacity_contributions=opacity_contributions,
                 fill_below=True,
@@ -332,9 +351,47 @@ class pRT_spectrum:
         
         fig = plt.gcf()
         fig.set_size_inches(7, 4)
+
         if wave_range_um!=[]:
             plt.xlim(wave_range_um[0]*1e-6,wave_range_um[1]*1e-6) # [m]
         else:
-            plt.xlim(self.wave_range[0]*1e-6,self.wave_range[1]*1e-6) # [m]
+            plt.xlim(self.params['METIS_wave_range_um'][0]*1e-6,self.params['METIS_wave_range_um'][1]*1e-6)
+            #plt.xlim(self.wave_range[0]*1e-6,self.wave_range[1]*1e-6) # [m]
         fig.tight_layout()    
-        plt.savefig(f'{self.project_path}/figures/input/opacity_contributions.pdf',dpi=200)
+        plt.savefig(f'{self.project_path}/figures/input/opacity_contributions.png',dpi=200)
+        plt.close()
+
+    def plot_VMRs_PT(self):
+
+        chem = self.params['chemistry']
+        fig,axes=plt.subplots(1,2,figsize=(6,3.5),dpi=200,gridspec_kw={'width_ratios':[1,0.4]},sharey=True)
+        ax,ax2=axes[0],axes[1]
+        for species_i in self.species_names:
+            col=self.species_info.loc[species_i,'color']
+            mathtext=self.species_info.loc[species_i,'mathtext_name']
+            if chem=='freechem':
+                VMR=10**self.params[f'log_{species_i}']*np.ones_like(self.pressure)
+            elif chem=='equ':
+                VMR = self.VMRs[species_i]
+            elif chem in ['Sorg1X','Sorg20X']:
+                tab = PSG_input(chem).table
+                VMR = tab[species_i].to_numpy()
+            ax.plot(VMR,self.pressure,label=mathtext,linestyle='solid',c=col)
+
+        ncol=int(len(self.species_names)//3) if len(self.species_names)>2 else 1
+        ax.legend(ncol=ncol,fontsize=7,loc='lower center')
+        ax.set_xscale('log')
+        ax.set_yscale('log')
+        ax.invert_yaxis()
+        ax.set_ylabel('Pressure [bar]')
+        ax.set_xlabel('VMR')
+        ax.set_xlim(1e-10,1e0)
+        ax.set_ylim(np.max(self.pressure),np.min(self.pressure))
+
+        ax2.plot(self.temperature,self.pressure,c='k')
+        ax2.yaxis.tick_right()   
+        ax2.set_xlabel('Temperature [K]')
+        fig.tight_layout()
+        plt.subplots_adjust(wspace=0)
+        plt.savefig(f'{self.project_path}/figures/input/VMRs_PT.pdf',dpi=200)
+        plt.close()

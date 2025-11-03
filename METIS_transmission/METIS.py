@@ -20,6 +20,15 @@ class METIS:
         self.cmd = sim.UserCommands(use_instrument="METIS",
                        set_modes=["lms"],
                        properties={"!OBS.wavelen": central_wavelength})
+        if 'pwv' in system_obj.parameters:
+            self.cmd['!ATMO']['pwv'] = system_obj.parameters['pwv'] # default: 2.5
+        if 'airmass' in system_obj.parameters:
+            self.cmd['!OBS']['airmass'] = system_obj.parameters['airmass'] # default: 1.2
+
+        # default seeing: 'PSF_LM_9mag_06seeing.fits'
+        # PSF model with a 0.6 arcsecond seeing for a 9th magnitude star
+        #print("cmd['OBS!']['psf_file']",self.cmd['OBS!']['psf_file'])
+
         self.metis = sim.OpticalTrain(self.cmd)
         self.transit_flux_array = system_obj.transit_flux_array
 
@@ -29,7 +38,7 @@ class METIS:
         self.figs_dir = pathlib.Path(f'{self.project_path}/figures/METIS_output')
         self.figs_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_observations(self,plot_exp=None):
+    def get_observations(self,plot_exp=None,delete_tmp_files=True):
 
         timeseries_extracted = pathlib.Path(f'{self.output_dir}/timeseries_{self.order}.npz')
         if timeseries_extracted.exists():
@@ -41,6 +50,28 @@ class METIS:
             transit, dark, flat, sky = self.observe_transit_calib(self.transit_flux_array,plot_exp=plot_exp)
             wl, fl, err = self.rectify_calibrate_extract(transit, dark, flat, sky, plot_exp=plot_exp)
             np.savez(timeseries_extracted, wl=wl, fl=fl, err=err)
+        print('*** Observation-time series ready ***')
+
+        # delete temporary files (observations & rectified), take up too much space
+        if delete_tmp_files and timeseries_extracted.exists(): 
+    
+            transit_frames = [f for f in self.output_dir.iterdir() if f.name.startswith('transit_frame_')]
+            
+            if len(transit_frames)>1:
+                print('Deleting raw transit frames')
+                for file in transit_frames:
+                    if file.name != 'transit_frame_0.fits':
+                        file.unlink(missing_ok=True) # delete
+            
+            keep = ['src_0','sky','dark','flat'] # keep for debugging/plotting
+            rect_files = [f for f in self.output_dir.iterdir() if f.name.startswith('rectified_')]
+            if len(rect_files)>4:
+                print('Deleting rectified files')
+                for file in rect_files:
+                    core_name = file.stem.replace('rectified_', '')  # remove prefix
+                    if core_name not in keep:
+                        file.unlink(missing_ok=True) # delete
+
         return wl, fl, err
         
     def observe_transit_calib(self,transit_flux_array,plot_exp=None):
@@ -48,14 +79,19 @@ class METIS:
         print(f'\n *** Generating observations... *** \n')
 
         transit_simulated_frames = []
+        hdul_src_0 = pathlib.Path(f'{self.output_dir}/transit_frame_0.fits')
         for i,fl in enumerate(transit_flux_array):
             
             hdul_src_path = pathlib.Path(f'{self.output_dir}/transit_frame_{int(i)}.fits')
+            rect_path = pathlib.Path(f'{self.output_dir}/rectified_src_{int(i)}.fits')
             
             if hdul_src_path.exists():
                 hdul_src = fits.open(hdul_src_path)
+            elif hdul_src_path.exists()==False and rect_path.exists():
+                # rectified bservation already generated, no need to make new obs
+                hdul_src = fits.open(hdul_src_0) # append dummy to list, will not be used
             else:
-                src = sim.Source(x=[0],y=[0],ref=[0], lam=self.planet_wl_obs_range, spectra=fl) 
+                src = sim.Source(x=[0],y=[0],ref=[0],lam=self.planet_wl_obs_range, spectra=fl) 
                 self.metis.observe(src)
                 hdul_src = self.metis.readout(exptime=self.exptime.value)[0]
                 dit  = self.metis.cmds.get("!OBS.dit", self.exptime)
@@ -65,6 +101,7 @@ class METIS:
                 hdr["DIT"]     = (dit, "Detector integration time [s]")
                 hdr["NDIT"]    = (ndit, "Number of DITs")
                 hdul_src.writeto(hdul_src_path, overwrite=True)
+
             transit_simulated_frames.append(hdul_src)
             
         self.hdr = hdul_src[1].header
@@ -176,13 +213,21 @@ class METIS:
         
         print(f'\n *** Calibrating observations... *** \n')
 
-        def get_rectified(target,hdul_raw):
+        def get_rectified(target,hdul_raw,delete_raw_hduls=True):
             rect_path = pathlib.Path(f'{self.output_dir}/rectified_{target}.fits')
             if rect_path.exists():
                 rect = fits.open(rect_path)[1]
             else:
                 rect = self.metis["lms_spectral_traces"].rectify_cube(hdul_raw)
                 rect.writeto(rect_path, overwrite=True)
+
+            keep = ['src_0','sky','dark','flat'] # keep for investigating/plotting
+            if delete_raw_hduls and target not in keep: # take up too much space
+                num = int(target.split('_')[1])
+                hdul_src_path = pathlib.Path(f'{self.output_dir}/transit_frame_{int(num)}.fits')
+                if hdul_src_path.exists():
+                    print(f'Created rectified_{target}, deleting transit_frame_{int(num)}')
+                    hdul_src_path.unlink(missing_ok=True)  # delete file
             return rect
                 
         rect_sky = get_rectified('sky',hdul_sky)
@@ -283,7 +328,10 @@ class METIS:
         for i,rect_src in enumerate(rect_src_frames):
             if i==0:
                 wavelengths, nwave = get_wavelegth_from_header(rect_src, self.hdr)
-            src = rect_src.data.astype(float)[:, :, clip_x:-clip_x]
+            try:
+                src = rect_src.data.astype(float)[:, :, clip_x:-clip_x]
+            except:
+                print('Corrupted:',i)
             src_dark = src - dark
             sky_dark = sky - dark
             src_dark_flat =  src_dark / flat

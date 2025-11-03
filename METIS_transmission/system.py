@@ -22,6 +22,8 @@ class System:
 
         self.R_star = parameters['R_star']
         self.d_star = parameters['d_star']
+        vbary = parameters['vbary']*u.km/u.s
+        vsys = parameters['vsys']*u.km/u.s
         sma = parameters['sma']
         period = parameters['period']
         incl = parameters['inclination']
@@ -33,19 +35,20 @@ class System:
         num_exp_in_transit = int(transit_duration.to(u.s)/self.exptime) # number of exposures during transit
         delta_phase = (transit_duration.to(u.day)/2/period).value # half duration in phase
         self.phase_transit = np.linspace(-delta_phase,delta_phase,num_exp_in_transit) # phase during transit
-        self.rv_transit = self.Kp*np.sin(2*np.pi*self.phase_transit)
-        #print(f"RV at ingress/egress: +/- {np.max(self.rv_transit):.3f}")
+        self.rv_transit = self.Kp*np.sin(2*np.pi*self.phase_transit)-vbary+vsys
+        print(f"RV at ingress/egress: {np.min(self.rv_transit.value):.3f} / {np.max(self.rv_transit.value):.3f} km/s")
 
         self.overhead = int(10) # total -> choose even number
         self.num_exp = num_exp_in_transit + self.overhead # total number of exposures
         print(f'{self.num_exp} exposures of {self.exptime} each = {self.num_exp*self.exptime}')
+        print(f'{num_exp_in_transit} exposures in transit = {num_exp_in_transit*self.exptime}')
         print(f'Transit duration = {transit_duration.to(u.s)}')
         idx = np.arange(self.num_exp)
         t_offsets = (idx - (self.num_exp - 1)/2.0) * self.exptime # time offset (in u.s) symmetric around mid-transit t=0
         t_offsets_days = t_offsets.to(u.day)
         self.phase_obs = (t_offsets_days / period).decompose().value # phase during observation (transit + overhead)
-        self.rv_obs = self.Kp * np.sin(2.0 * np.pi * self.phase_obs) 
-        #print(f"RV at obs start/end: +/- {np.max(rv_obs):.3f}")
+        self.rv_obs = self.Kp * np.sin(2.0 * np.pi * self.phase_obs)-vbary+vsys
+        print(f"RV at obs start/end: {np.min(self.rv_obs.value):.3f} / {np.max(self.rv_obs.value):.3f} km/s")
 
         self.planet_wl_um, transit_radii_um  = self.get_planet_spectrum()
         self.transit_radii_cm = (transit_radii_um.to(u.cm))
@@ -75,6 +78,7 @@ class System:
             pRT_model_object = pRT_spectrum(self.parameters)
             planet_wl_um, transit_radii_um = pRT_model_object.make_spectrum(save_as='planet_spectrum')
             pRT_model_object.plot_opacities()
+            pRT_model_object.plot_VMRs_PT()
             pRT_model_object.plot_opacity_contr()
 
         return planet_wl_um, transit_radii_um
