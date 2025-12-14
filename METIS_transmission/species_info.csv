@@ -2,7 +2,7 @@ name,pRT_name,Hill_notation,mass,color,mathtext_name,C,O,H,N,S
 H2,H2,H2,2.01568,skyblue,H$_2$,0,0,2,0,0
 He,He,He,4.002602,gold,He,0,0,0,0,0
 H2O,H2O,H2O1,18.014680000000002,dodgerblue,H$_2$O,0,1,2,0,0
-CH4,CH4,C1H4,16.04236,sienna,CH$_4$,1,0,4,0,0
+CH4,CH4,C1H4,16.04236,limegreen,CH$_4$,1,0,4,0,0
 CO,CO,C1O1,28.009999999999998,olive,CO,1,1,0,0,0
 NH3,NH3,H3N1,17.03022,tab:green,NH$_3$,0,0,3,1,0
 H2S,H2S,H2S1,34.08068,hotpink,H$_2$S,0,0,2,0,1

@@ -16,7 +16,6 @@ class System:
 
         self.parameters = parameters
         self.project_path = parameters['project_path'] 
-        self.exptime = parameters['exptime_per_frame']
         figs_path = pathlib.Path(f'{self.project_path}/figures/input')
         figs_path.mkdir(parents=True, exist_ok=True)
 
@@ -32,16 +31,28 @@ class System:
         print(f"Kp = {self.Kp:.3f}")
 
         transit_duration = 2.67*u.h
-        num_exp_in_transit = int(transit_duration.to(u.s)/self.exptime) # number of exposures during transit
+
+        if 'exptime_per_frame' in parameters:
+            self.exptime = parameters['exptime_per_frame']
+            num_exp_in_transit = int(transit_duration.to(u.s)/self.exptime) # number of exposures during transit
+
+        elif 'num_exp_in_transit' in parameters:
+            num_exp_in_transit = parameters['num_exp_in_transit']
+            self.exptime = transit_duration.to(u.s)/num_exp_in_transit
+
         delta_phase = (transit_duration.to(u.day)/2/period).value # half duration in phase
         self.phase_transit = np.linspace(-delta_phase,delta_phase,num_exp_in_transit) # phase during transit
         self.rv_transit = self.Kp*np.sin(2*np.pi*self.phase_transit)-vbary+vsys
         print(f"RV at ingress/egress: {np.min(self.rv_transit.value):.3f} / {np.max(self.rv_transit.value):.3f} km/s")
 
-        self.overhead = int(10) # total -> choose even number
+        if 'num_overhead' in parameters:
+            self.overhead = int(parameters['num_overhead']) # even num
+        else:
+            #self.overhead = int(10) # total -> choose even number
+            self.overhead = num_exp_in_transit*2
         self.num_exp = num_exp_in_transit + self.overhead # total number of exposures
-        print(f'{self.num_exp} exposures of {self.exptime} each = {self.num_exp*self.exptime}')
-        print(f'{num_exp_in_transit} exposures in transit = {num_exp_in_transit*self.exptime}')
+        print(f'{self.num_exp} frames of {self.exptime} each = {self.num_exp*self.exptime}')
+        print(f'{num_exp_in_transit} frames in transit = {num_exp_in_transit*self.exptime}')
         print(f'Transit duration = {transit_duration.to(u.s)}')
         idx = np.arange(self.num_exp)
         t_offsets = (idx - (self.num_exp - 1)/2.0) * self.exptime # time offset (in u.s) symmetric around mid-transit t=0
@@ -77,7 +88,7 @@ class System:
         else:
             pRT_model_object = pRT_spectrum(self.parameters)
             planet_wl_um, transit_radii_um = pRT_model_object.make_spectrum(save_as='planet_spectrum')
-            pRT_model_object.plot_opacities()
+            #pRT_model_object.plot_opacities()
             pRT_model_object.plot_VMRs_PT()
             pRT_model_object.plot_opacity_contr()
 

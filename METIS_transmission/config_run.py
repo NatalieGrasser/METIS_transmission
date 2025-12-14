@@ -9,6 +9,7 @@ os.environ['OMP_NUM_THREADS'] = '1' # to avoid using too many CPUs, important fo
 from system import System
 from METIS import METIS
 from crosscorr import CrossCorr
+from pRT_model import *
 from PyAstronomy.pyasl import helcorr
 from astropy.coordinates import SkyCoord
 from astropy.coordinates import Angle
@@ -30,9 +31,12 @@ def init_simulation(project_name='Sorg20X',chemistry=None,test_on_input=False):
     elif project_name=='test':
         species_names = ['H2','He','H2O','CH4']
     
-    observation_properties = {'exptime_per_frame': 200*u.s,
+    observation_properties = {#'exptime_per_frame': 800*u.s,
+                            'num_exp_in_transit': 5,
+                            'num_overhead': 10, 
                             'METIS_wave_range_um': [3.05,3.35],  # 0.3um wide
                             'pRT_wave_range_um': [2.8,3.6],
+                            'n_transits': 3
                             } # wider range for cross-correlation
 
     system_properties = {'planet_radius': 0.23* cst.r_jup_mean,
@@ -51,7 +55,7 @@ def init_simulation(project_name='Sorg20X',chemistry=None,test_on_input=False):
                         'JD': 2456836.17187 # Howard 2025 https://exoplanetarchive.ipac.caltech.edu/overview/k2-18b
                         }
 
-    atmosphere_properties = {'pressure': np.logspace(-6, 2, 100),
+    atmosphere_properties = {'pressure': np.logspace(-6, 0, 100),
                             'temperature': 300,
                             'log_g': 3}
 
@@ -106,6 +110,7 @@ def run_simulation(system_obj):
     project_name = parameters['project_name']
     species_names = parameters['species_names']
     test_on_input = parameters['test_on_input']
+    n_transits = parameters['n_transits']
 
     # for the future, center at ~3.30 µm (≈ 3.15–3.45 µm) for DMS, CH4, H2O
     wavelength_range = parameters['METIS_wave_range_um']  # 0.3um
@@ -113,65 +118,78 @@ def run_simulation(system_obj):
     n_wave_orders = int((wavelength_range[-1]-wavelength_range[0])/wave_width)
     central_waves = np.arange(wavelength_range[0]+wave_width/2,wavelength_range[-1],wave_width)
     transit_flux_array = system_obj.get_transit_array(wavelength_range,plot=True)
-    print(f'\n{n_wave_orders} orders, range {wavelength_range[0]}-{wavelength_range[1]}um \n')
+    print(f'{n_wave_orders} orders, range {wavelength_range[0]}-{wavelength_range[1]}um \n')
 
     if project_name=='test':
         central_waves = [central_waves[0]] # for testing
     
+    #central_waves = [central_waves[0],central_waves[1]]
     #central_waves = [central_waves[0]]
     #central_waves = [central_waves[-1]]
     #central_waves = central_waves[:-1]
 
+    n_orders = len(central_waves)
+    n_exp = system_obj.num_exp
 
     if test_on_input:
         print('*** Testing on input data. ***')
+        n_transits = 1
+        system_obj.parameters['n_transits'] = 1
 
     plot_exp = 0
     plot_order= 0
-    wl_obs, fl_obs, err_obs = [],[],[]
-    for order,central_wave in enumerate(central_waves):
-        print(f'\n ***** Simulating order {order}, central wavelength {np.round(central_wave,decimals=3)}um ***** \n')
-        metis = METIS(central_wave,system_obj,order=order)
-        wl, fl, err = metis.get_observations(plot_exp=plot_exp)
+    fl_obs = np.empty((n_transits,n_orders,n_exp),dtype=object)
+    err_obs = np.empty((n_transits,n_orders,n_exp),dtype=object)
+    wl_obs = np.empty((n_orders),dtype=object)
+    for nt in range(n_transits):
+        print(f'######## TRANSIT {nt+1} ########')
+        for order,central_wave in enumerate(central_waves):
+            print(f'\n ***** Simulating order {order}, central wavelength {np.round(central_wave,decimals=3)}um ***** \n')
+            metis = METIS(central_wave,system_obj,order=order,n_transit=nt)
+            wl, fl, err = metis.get_observations(plot_exp=plot_exp)
 
-        if test_on_input:
-            transit_input_folder = pathlib.Path(f'{system_obj.project_path}/test_input')
-            transit_input_folder.mkdir(parents=True, exist_ok=True)
-            transit_path_i = pathlib.Path(f'{transit_input_folder}/input_timeseries_{order}.npy')
-            if transit_path_i.exists():
-                fl = np.load(transit_path_i) # save only flux, take wl & err from sim data
-            else:
-                transit_flux_i = fl.copy() # init array shaped like simulated flux
-                n_exp = len(fl)
-                for exp in range(n_exp):
-                    interp_flux = np.interp(wl,system_obj.planet_wl_obs_range.value,transit_flux_array[exp].value)
-                    transit_flux_i[exp] = interp_flux
-                fl = transit_flux_i
-                np.save(transit_path_i, fl)
-        wl_obs.append(wl)
-        fl_obs.append(fl)
-        err_obs.append(err)
+            if test_on_input:
+                transit_input_folder = pathlib.Path(f'{system_obj.project_path}/test_input')
+                transit_input_folder.mkdir(parents=True, exist_ok=True)
+                transit_path_i = pathlib.Path(f'{transit_input_folder}/input_timeseries_{order}.npy')
+                if transit_path_i.exists():
+                    fl = np.load(transit_path_i) # save only flux, take wl & err from sim data
+                else:
+                    transit_flux_i = fl.copy() # init array shaped like simulated flux
+                    n_exp = len(fl)
+                    for exp in range(n_exp):
+                        interp_flux = np.interp(wl,system_obj.planet_wl_obs_range.value,transit_flux_array[exp].value)
+                        transit_flux_i[exp] = interp_flux
+                    fl = transit_flux_i
+                    np.save(transit_path_i, fl)
+            wl_obs[order]= wl
+            for exp in range(n_exp):
+                fl_obs[nt,order,exp] = fl[exp]
+                err_obs[nt,order,exp] = err[exp]
 
-    print('*** Observation-time series is ready. ***')
+    print('*** Full observation-time series is ready. ***')
 
-    # flux has shape (n_order,n_exp,n_wl), reformat into (n_exp,n_order,n_wl)
+    # flux has shape (n_trans,n_order,n_exp,n_wl), reformat into (n_trans,n_exp,n_order,n_wl)
     # wavelength arrays may have different lengths
-    n_orders = len(fl_obs)
-    n_exp = len(fl_obs[0])
-    fl_array = np.empty((n_exp, n_orders), dtype=object)
-    err_array = np.empty((n_exp, n_orders), dtype=object)
-    for exp in range(n_exp):
-        for ord in range(n_orders):
-            fl_array[exp][ord] = fl_obs[ord][exp]  
-            err_array[exp][ord] = err_obs[ord][exp]
+    
+    fl_array = np.empty((n_transits, n_exp, n_orders), dtype=object)
+    err_array = np.empty((n_transits, n_exp, n_orders), dtype=object)
+    for nt in range(n_transits):
+        for exp in range(n_exp):
+            for ord in range(n_orders):
+                fl_array[nt][exp][ord] = fl_obs[nt][ord][exp]  
+                err_array[nt][exp][ord] = err_obs[nt][ord][exp]
 
     print(f'\n ***** Cross-correlating... ***** \n')
-    CrossCorr(system_obj, wl_obs, fl_array, err_array, plot_order=0) # cc with input
+    cc_obj = CrossCorr(system_obj, wl_obs, fl_array, err_array, plot_order=0) # cc with input
 
     line_species = [s for s in species_names if s not in ('H2', 'He')]
+    line_species = ['H2O','CH4','C2H2','C2H4','C2H6'] # detectable in noiseless telluricless input
     for species_i in line_species:
         CrossCorr(system_obj, wl_obs, fl_array, err_array, plot_order=plot_order, template=species_i)
 
+    cc_obj.plot_ccfs()
+    
     print(f'\n ***** All done. Exiting. ***** \n')
 
 if __name__ == '__main__':

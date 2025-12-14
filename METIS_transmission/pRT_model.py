@@ -6,6 +6,7 @@ import os
 from utils import *
 from petitRADTRANS.radtrans import Radtrans
 import pathlib
+import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from astropy.table import QTable
@@ -306,7 +307,9 @@ class pRT_spectrum:
         plt.savefig(f'{self.project_path}/figures/input/opacities.pdf',dpi=200)
         plt.close()
 
-    def plot_opacity_contr(self,species=None,wave_range_um=[],include_total=False,include_cont_species=False):
+    def plot_opacity_contr(self,species=['H2O','CH4','C2H2','C2H4','C2H6'],
+                           wave_range_um=[],lw=0.5,top_n=5,alph=0.7,
+                           include_total=False,include_cont_species=False):
 
         common_params = {'mode': 'transmission',
                         'temperatures': self.temperature,
@@ -317,8 +320,22 @@ class pRT_spectrum:
                         'reference_pressure': self.ref_pressure}
 
         opacity_contributions = self.radtrans.calculate_contribution_spectra(**common_params)
+        species_contributions = {}
+        # Extract wavelength grid (same for all)
+        lam = opacity_contributions['Total'][0]
+
+        # Line species
+        for spec, (spec_lam, spec_op, _) in opacity_contributions['line_species'].items():
+            # sanity check: lam should match spec_lam; if not, interpolate
+            if not np.allclose(spec_lam, lam):
+                spec_op = np.interp(lam, spec_lam, spec_op)
+            species_contributions[spec] = np.max(spec_op) #np.trapz(spec_op, lam)
+
+        top = sorted(species_contributions, key=species_contributions.get, reverse=True)[:top_n]
+        
         if species is None:
-            species = self.species_names
+            #species = self.species_names
+            species = top
 
         include_contributions = []
         if include_total:
@@ -345,28 +362,52 @@ class pRT_spectrum:
                     'line_species': '-',
                     'rayleigh_species': '--'},
                 opacity_contributions=opacity_contributions,
-                fill_below=True,
-                #x_axis_scale='log',
+                fill_below=False,
+                show_legend=False,
+                #y_axis_scale='log',
                 **common_params)
         
         fig = plt.gcf()
-        fig.set_size_inches(7, 4)
+        fig.set_size_inches(5.5, 3.5)
+        for line in fig.axes[0].get_lines():
+            line.set_linewidth(lw)
+            line.set_alpha(alph)
 
+        for ax in fig.axes:
+            for leg in ax.get_children():
+                if isinstance(leg, matplotlib.legend.Legend):
+                    leg.remove()
+        for leg in fig.get_children():
+            if isinstance(leg, matplotlib.legend.Legend):
+                leg.remove()
+
+        legend_ax = fig.axes[0]
+        handles, labels = legend_ax.get_legend_handles_labels()
+        leg = legend_ax.legend(handles, labels, ncol=(len(species)+1)//2, loc="upper center")
+        #leg.set_bbox_to_anchor((1.05, 1))   # x=1.05 puts it outside the axis
+        #leg.set_loc("upper left")         # anchor point of the legend box
+        for legline in leg.get_lines():
+            legline.set_linewidth(2)
+            legline.set_alpha(1.0)
+
+        plt.ylim(1.6*1e7,1.8*1e7)
         if wave_range_um!=[]:
             plt.xlim(wave_range_um[0]*1e-6,wave_range_um[1]*1e-6) # [m]
         else:
             plt.xlim(self.params['METIS_wave_range_um'][0]*1e-6,self.params['METIS_wave_range_um'][1]*1e-6)
             #plt.xlim(self.wave_range[0]*1e-6,self.wave_range[1]*1e-6) # [m]
         fig.tight_layout()    
-        plt.savefig(f'{self.project_path}/figures/input/opacity_contributions.png',dpi=200)
+        plt.savefig(f'{self.project_path}/figures/input/opacity_contributions.pdf',dpi=200)
         plt.close()
 
-    def plot_VMRs_PT(self):
+    def plot_VMRs_PT(self,species=['H2O','CH4','C2H2','C2H4','C2H6']):
 
         chem = self.params['chemistry']
         fig,axes=plt.subplots(1,2,figsize=(6,3.5),dpi=200,gridspec_kw={'width_ratios':[1,0.4]},sharey=True)
         ax,ax2=axes[0],axes[1]
-        for species_i in self.species_names:
+        if species == None:
+            species = self.species_names
+        for species_i in species:
             col=self.species_info.loc[species_i,'color']
             mathtext=self.species_info.loc[species_i,'mathtext_name']
             if chem=='freechem':
