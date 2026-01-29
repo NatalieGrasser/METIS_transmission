@@ -12,7 +12,7 @@ from pRT_model import *
 
 class System:
 
-    def __init__(self,parameters,plot=False):
+    def __init__(self,parameters,plot=False,plot_spectrum=False,ax=None):
 
         self.parameters = parameters
         self.project_path = parameters['project_path'] 
@@ -40,10 +40,19 @@ class System:
             num_exp_in_transit = parameters['num_exp_in_transit']
             self.exptime = transit_duration.to(u.s)/num_exp_in_transit
 
+        # Observed in-transit RVs
         delta_phase = (transit_duration.to(u.day)/2/period).value # half duration in phase
         self.phase_transit = np.linspace(-delta_phase,delta_phase,num_exp_in_transit) # phase during transit
         self.rv_transit = self.Kp*np.sin(2*np.pi*self.phase_transit)-vbary+vsys
-        print(f"RV at ingress/egress: {np.min(self.rv_transit.value):.3f} / {np.max(self.rv_transit.value):.3f} km/s")
+        
+        # True ingress/egress RVs
+        self.phase_ingress = -delta_phase
+        self.phase_egress  =  delta_phase
+        self.rv_ingress = self.Kp * np.sin(2*np.pi*self.phase_ingress) - vbary + vsys
+        self.rv_egress  = self.Kp * np.sin(2*np.pi*self.phase_egress)  - vbary + vsys
+        print(f"RV at ingress/egress: "
+            f"{self.rv_ingress.value:.3f} / {self.rv_egress.value:.3f} km/s")
+        #print(f"RV at ingress/egress: {np.min(self.rv_transit.value):.3f} / {np.max(self.rv_transit.value):.3f} km/s")
 
         if 'num_overhead' in parameters:
             self.overhead = int(parameters['num_overhead']) # even num
@@ -61,7 +70,7 @@ class System:
         self.rv_obs = self.Kp * np.sin(2.0 * np.pi * self.phase_obs)-vbary+vsys
         print(f"RV at obs start/end: {np.min(self.rv_obs.value):.3f} / {np.max(self.rv_obs.value):.3f} km/s")
 
-        self.planet_wl_um, transit_radii_um  = self.get_planet_spectrum()
+        self.planet_wl_um, transit_radii_um  = self.get_planet_spectrum(plot_spectrum=plot_spectrum,ax=ax)
         self.transit_radii_cm = (transit_radii_um.to(u.cm))
         self.delta_lambda = ((self.transit_radii_cm / self.R_star.to(u.cm))**2).value  # wavelength-dependent transit depth
         star_wl, star_flx = self.get_stellar_spectrum()
@@ -78,19 +87,19 @@ class System:
             self.plot_stellar_spectrum()
             self.plot_planet_transmission()
 
-    def get_planet_spectrum(self):
+    def get_planet_spectrum(self,plot_spectrum=True,ax=None):
         planet_spectrum = pathlib.Path(f'{self.project_path}/pRT_spectra/planet_spectrum.fits')
 
-        if planet_spectrum.exists():
+        if planet_spectrum.exists() and plot_spectrum==False:
             tbl = QTable.read(planet_spectrum)
             planet_wl_um = tbl['wavelength'] # in um
             transit_radii_um = tbl['flux'] # in um
         else:
             pRT_model_object = pRT_spectrum(self.parameters)
-            planet_wl_um, transit_radii_um = pRT_model_object.make_spectrum(save_as='planet_spectrum')
+            planet_wl_um, transit_radii_um = pRT_model_object.make_spectrum(save_path=planet_spectrum)
             #pRT_model_object.plot_opacities()
             pRT_model_object.plot_VMRs_PT()
-            pRT_model_object.plot_opacity_contr()
+            pRT_model_object.plot_opacity_contr(ax=ax)
 
         return planet_wl_um, transit_radii_um
 

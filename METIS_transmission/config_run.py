@@ -8,14 +8,21 @@ import os
 os.environ['OMP_NUM_THREADS'] = '1' # to avoid using too many CPUs, important for MPI
 from system import System
 from METIS import METIS
-from crosscorr import CrossCorr
+from crosscorr import *
 from pRT_model import *
 from PyAstronomy.pyasl import helcorr
 from astropy.coordinates import SkyCoord
 from astropy.coordinates import Angle
 from utils import *
 
-def init_simulation(project_name='Sorg20X',chemistry=None,test_on_input=False):
+#conda activate py_311
+#nohup mpiexec -np 20 python config_run.py Sorg20X > & output.out &
+
+#test on input, contains no tellurics though!
+#nohup mpiexec -np 20 python config_run.py Sorg20X t > & output.out &
+
+def init_simulation(project_name='Sorg20X',chemistry=None,
+                    test_on_input=False,plot_spectrum=False,ax=None):
 
     project_name = project_name
     if 'Sorg' in project_name:
@@ -33,14 +40,14 @@ def init_simulation(project_name='Sorg20X',chemistry=None,test_on_input=False):
     
     observation_properties = {#'exptime_per_frame': 800*u.s,
                             'num_exp_in_transit': 5,
-                            'num_overhead': 10, 
+                            #'num_overhead': 2, 
                             'METIS_wave_range_um': [3.05,3.35],  # 0.3um wide
-                            'pRT_wave_range_um': [2.8,3.6],
-                            'n_transits': 3
-                            } # wider range for cross-correlation
+                            'pRT_wave_range_um': [2.8,3.6], # wider range for cross-correlation
+                            'n_transits': 5,
+                            'resolution': 1e5} 
 
-    system_properties = {'planet_radius': 0.23* cst.r_jup_mean,
-                        'R_star': 0.5 * u.R_sun, # stellar radius
+    system_properties = {'planet_radius': 0.22* cst.r_jup_mean,
+                        'R_star': 0.47 * u.R_sun, # stellar radius
                         'd_star': 38 * u.pc, # distance to K2-18
                         #'d_star': 10 * u.pc, # testing!!
                         'period': 32.9*u.day,
@@ -56,7 +63,7 @@ def init_simulation(project_name='Sorg20X',chemistry=None,test_on_input=False):
                         }
 
     atmosphere_properties = {'pressure': np.logspace(-6, 0, 100),
-                            'temperature': 300,
+                            'temperature': 280,
                             'log_g': 3}
 
     chemsitry_properties = {'species_names': species_names,
@@ -100,7 +107,16 @@ def init_simulation(project_name='Sorg20X',chemistry=None,test_on_input=False):
                 **chemsitry_properties}
     parameters['project_path'] = os.path.join(os.getcwd(),project_name)
     parameters['test_on_input'] = test_on_input
-    system_obj = System(parameters,plot=True)
+
+    if project_name == 'Sorg1X':
+        label = r'1$\times\,\,$S$_\mathrm{org}$'
+    elif project_name == 'Sorg20X':
+        label = r'20$\times\,\,$S$_\mathrm{org}$'
+    else:
+        label = ''
+    parameters['label'] = label
+    
+    system_obj = System(parameters,plot=True,plot_spectrum=plot_spectrum,ax=ax)
 
     return system_obj
 
@@ -119,12 +135,13 @@ def run_simulation(system_obj):
     central_waves = np.arange(wavelength_range[0]+wave_width/2,wavelength_range[-1],wave_width)
     transit_flux_array = system_obj.get_transit_array(wavelength_range,plot=True)
     print(f'{n_wave_orders} orders, range {wavelength_range[0]}-{wavelength_range[1]}um \n')
-
+    #print(lala)
     if project_name=='test':
         central_waves = [central_waves[0]] # for testing
     
+    #central_waves = [central_waves[0],central_waves[1],central_waves[2]
+                        #,central_waves[3],central_waves[4]]
     #central_waves = [central_waves[0],central_waves[1]]
-    #central_waves = [central_waves[0]]
     #central_waves = [central_waves[-1]]
     #central_waves = central_waves[:-1]
 
@@ -142,7 +159,7 @@ def run_simulation(system_obj):
     err_obs = np.empty((n_transits,n_orders,n_exp),dtype=object)
     wl_obs = np.empty((n_orders),dtype=object)
     for nt in range(n_transits):
-        print(f'######## TRANSIT {nt+1} ########')
+        print(f'\n######## TRANSIT {nt+1} ########')
         for order,central_wave in enumerate(central_waves):
             print(f'\n ***** Simulating order {order}, central wavelength {np.round(central_wave,decimals=3)}um ***** \n')
             metis = METIS(central_wave,system_obj,order=order,n_transit=nt)
@@ -181,14 +198,33 @@ def run_simulation(system_obj):
                 err_array[nt][exp][ord] = err_obs[nt][ord][exp]
 
     print(f'\n ***** Cross-correlating... ***** \n')
-    cc_obj = CrossCorr(system_obj, wl_obs, fl_array, err_array, plot_order=0) # cc with input
+    #cc_obj = CrossCorr(system_obj, wl_obs, fl_array, err_array, plot_order=0) # cc with input
 
-    line_species = [s for s in species_names if s not in ('H2', 'He')]
-    line_species = ['H2O','CH4','C2H2','C2H4','C2H6'] # detectable in noiseless telluricless input
-    for species_i in line_species:
-        CrossCorr(system_obj, wl_obs, fl_array, err_array, plot_order=plot_order, template=species_i)
+    #line_species = [s for s in species_names if s not in ('H2', 'He')]
+    #line_species = ['H2O','CH4','C2H2','C2H4','C2H6'] # detectable in noiseless telluricless input
+    #for species_i in line_species:
+        #CrossCorr(system_obj, wl_obs, fl_array, err_array, plot_order=plot_order, template=species_i)
 
-    cc_obj.plot_ccfs()
+    #cc_obj.plot_ccfs()
+    if False:
+        multi_transit_ccfs(system_obj, wl_obs, fl_array, err_array,
+                        species=['H2O','CH4','C2H2','C2H4','C2H6','CO2','input'],
+                        #species=['input'],
+                        transits=n_transits,sysit=1,
+                        abund='best',
+                        #single_transit_only=True,
+                        animate=True)
+        
+    if True:
+        abunds = np.linspace(-10,0,11)
+        transits = np.linspace(1,5,5, dtype=int)
+        multi_transit_abundance_map(system_obj,
+                                    wl_obs,
+                                    fl_array,
+                                    err_array,
+                                    species=['H2O','CH4','C2H2','C2H4','C2H6','CO2'],
+                                    abunds=abunds,
+                                    transits=transits)
     
     print(f'\n ***** All done. Exiting. ***** \n')
 

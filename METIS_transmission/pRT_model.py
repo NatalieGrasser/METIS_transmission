@@ -5,6 +5,7 @@ import os
 #petitradtrans_config_parser.set_input_data_path('/net/lem/data2/pRT3_formatted')
 from utils import *
 from petitRADTRANS.radtrans import Radtrans
+from petitRADTRANS import physical_constants as cst
 import pathlib
 import matplotlib
 import matplotlib.pyplot as plt
@@ -174,8 +175,8 @@ class pRT_spectrum:
         return self.mass_fractions
 
     def free_chemistry(self,species_pRT,params):
-        VMR_He = 0.15
-        VMR_wo_H2 = 0 + VMR_He  # Total VMR without H2, starting with He
+
+        VMR_wo_H2 = np.zeros(self.n_atm_layers)  # Total VMR without H2
         mass_fractions = {} # Create a dictionary for all used species
         C, O, H = 0, 0, 0
 
@@ -199,6 +200,11 @@ class pRT_spectrum:
                 H += COH_i[2] * VMR_i
 
         # Add the H2 and He abundances
+        if VMR_wo_H2[0]>=1e-1:
+            VMR_He = 0.05*np.ones(self.n_atm_layers)
+        else:
+            VMR_He = 0.15*np.ones(self.n_atm_layers)
+        VMR_wo_H2+=VMR_He
         mass_fractions['He'] = self.read_species_info('He', 'mass')*VMR_He
         mass_fractions['H2'] = self.read_species_info('H2', 'mass')*(1-VMR_wo_H2)
         H += self.read_species_info('H2','H')*(1-VMR_wo_H2) # Add to the H-bearing species
@@ -223,11 +229,16 @@ class pRT_spectrum:
 
         return mass_fractions, CO, FeH
 
-    def make_spectrum(self, save_as=None):
+    def make_spectrum(self, species=None, save_path=None):
 
         self.species_pRT = [self.species_pRT] if not isinstance(self.species_pRT, list) else self.species_pRT
 
-        CIA =  ['H2--H2','H2--He']
+        rayleigh_species=['H2', 'He']
+        if species in self.species_info.index:
+            CIA=[]
+            rayleigh_species=[]
+        else:
+            CIA =  ['H2--H2','H2--He']
                 #'CH4--CH4','CH4--He','CO2--CH4',
                 #,'CO2--H2','CO2--He','H2--CH4','H2O--H2O']
         if 'H2O' in self.species_pRT:
@@ -238,11 +249,10 @@ class pRT_spectrum:
         self.radtrans = Radtrans(
                 pressures=self.pressure,
                 line_species=self.species_pRT,
-                rayleigh_species=['H2', 'He'],
+                rayleigh_species=rayleigh_species,
                 gas_continuum_contributors=CIA,
                 wavelength_boundaries=[self.wave_range[0],self.wave_range[1]], # microns (L-band)
                 line_opacity_mode='lbl')
-    
         
         planet_wl_cm, transit_radii_cm, _ = self.radtrans.calculate_transit_radii(temperatures=self.temperature,
                                                                         mass_fractions=self.mass_fractions,
@@ -250,7 +260,7 @@ class pRT_spectrum:
                                                                         reference_gravity=self.gravity,
                                                                         planet_radius=self.planet_radius,
                                                                         reference_pressure=self.ref_pressure)
-        
+
         wl_shifted= planet_wl_cm*(1.0+(self.params['vsys']-self.params['vbary'])/const.c.to('km/s').value)
         transit_radii_cm = np.interp(planet_wl_cm, wl_shifted, transit_radii_cm)
         
@@ -259,17 +269,29 @@ class pRT_spectrum:
             epsilon_limb = self.params.get('epsilon_limb', 0.5)
             transit_radii_cm = fastRotBroad(planet_wl_cm, transit_radii_cm, epsilon_limb, self.params['vsini'].value) 
         
-        transit_radii_cm = instrumental_broadening(planet_wl_cm, transit_radii_cm, resolution=1e5)
+        transit_radii_cm = instrumental_broadening(planet_wl_cm, transit_radii_cm, resolution=self.params['resolution'])
         n_clip = 100 # clip weird edges from fastRotBroad
         transit_radii_um = (transit_radii_cm[n_clip:-n_clip]*1e4)*u.um
         planet_wl_um = (planet_wl_cm[n_clip:-n_clip]*1e4)*u.um
 
-        if save_as is not None:
+        if save_path is not None:
             output_dir = pathlib.Path(f'{self.project_path}/pRT_spectra')
             output_dir.mkdir(parents=True, exist_ok=True)
-            planet_spectrum = pathlib.Path(f'{output_dir}/{save_as}.fits')
             tbl = QTable([planet_wl_um, transit_radii_um], names=['wavelength', 'flux'])
-            tbl.write(planet_spectrum, overwrite=True)
+            tbl.write(save_path, overwrite=True)
+            
+            # if specific species
+            if species in self.species_info.index:
+                color = self.species_info.loc[species,'color']
+                mathtext = self.species_info.loc[species,'mathtext_name']
+                fig,ax=plt.subplots(1,1,figsize=(4,2),dpi=200)
+                ax.plot(planet_wl_um,transit_radii_um*1e-6,c=color,lw=0.8)
+                ax.set_ylabel('Transit radius [m]')
+                ax.set_xlabel('Wavelength (micron)')
+                ax.set_xlim(3.0,3.4)
+                fig.tight_layout()
+                fig.savefig(f'{self.project_path}/figures/input/{species}_spectrum.pdf', dpi=200)
+                plt.close(fig)
 
         return planet_wl_um, transit_radii_um
     
@@ -307,9 +329,10 @@ class pRT_spectrum:
         plt.savefig(f'{self.project_path}/figures/input/opacities.pdf',dpi=200)
         plt.close()
 
-    def plot_opacity_contr(self,species=['H2O','CH4','C2H2','C2H4','C2H6'],
-                           wave_range_um=[],lw=0.5,top_n=5,alph=0.7,
-                           include_total=False,include_cont_species=False):
+    def plot_opacity_contr(self,species=['H2O','CH4','C2H2','C2H4','C2H6','CO2'],
+                           wave_range_um=[],lw=0.7,top_n=8,alph=0.6,
+                           include_total=False,include_cont_species=False,
+                           ax=None,add_transit_depth=False):
 
         common_params = {'mode': 'transmission',
                         'temperatures': self.temperature,
@@ -334,8 +357,13 @@ class pRT_spectrum:
         top = sorted(species_contributions, key=species_contributions.get, reverse=True)[:top_n]
         
         if species is None:
-            #species = self.species_names
-            species = top
+            species = self.species_names
+            #species = top
+
+        if ax is None:
+            return_ax=False
+        else:
+            return_ax = True
 
         include_contributions = []
         if include_total:
@@ -364,12 +392,14 @@ class pRT_spectrum:
                 opacity_contributions=opacity_contributions,
                 fill_below=False,
                 show_legend=False,
+                ax=ax,
                 #y_axis_scale='log',
                 **common_params)
         
         fig = plt.gcf()
-        fig.set_size_inches(5.5, 3.5)
-        for line in fig.axes[0].get_lines():
+        if return_ax==False:
+            ax = fig.axes[0]
+        for line in ax.get_lines():
             line.set_linewidth(lw)
             line.set_alpha(alph)
 
@@ -381,24 +411,75 @@ class pRT_spectrum:
             if isinstance(leg, matplotlib.legend.Legend):
                 leg.remove()
 
-        legend_ax = fig.axes[0]
-        handles, labels = legend_ax.get_legend_handles_labels()
-        leg = legend_ax.legend(handles, labels, ncol=(len(species)+1)//2, loc="upper center")
-        #leg.set_bbox_to_anchor((1.05, 1))   # x=1.05 puts it outside the axis
-        #leg.set_loc("upper left")         # anchor point of the legend box
-        for legline in leg.get_lines():
-            legline.set_linewidth(2)
-            legline.set_alpha(1.0)
+        if return_ax==False:
+            fig.set_size_inches(5, 3.5)
+            handles, labels = ax.get_legend_handles_labels()
+            if len(species)<7:
+                ncol = (len(species)+1)//2
+            else:
+                ncol = (len(species)+1)//3
+            leg = ax.legend(handles, labels, ncol=ncol, loc="upper center")
+            #leg.set_bbox_to_anchor((1.05, 1))   # x=1.05 puts it outside the axis
+            #leg.set_loc("upper left")         # anchor point of the legend box
+            for legline in leg.get_lines():
+                legline.set_linewidth(2)
+                legline.set_alpha(1.0)
+            leg.get_frame().set_linewidth(0.0)
 
-        plt.ylim(1.6*1e7,1.8*1e7)
-        if wave_range_um!=[]:
-            plt.xlim(wave_range_um[0]*1e-6,wave_range_um[1]*1e-6) # [m]
+        if return_ax:
+            ymax = max([spec_op.max() for spec_lam, spec_op, _ in opacity_contributions['line_species'].values()])
+            ax.set_ylim(1.6*1e7 / cst.r_jup_mean * 1e2, ymax/ cst.r_jup_mean)
         else:
-            plt.xlim(self.params['METIS_wave_range_um'][0]*1e-6,self.params['METIS_wave_range_um'][1]*1e-6)
-            #plt.xlim(self.wave_range[0]*1e-6,self.wave_range[1]*1e-6) # [m]
-        fig.tight_layout()    
-        plt.savefig(f'{self.project_path}/figures/input/opacity_contributions.pdf',dpi=200)
-        plt.close()
+            ax.set_ylim(1.6*1e7/cst.r_jup_mean*1e2,1.8*1e7/cst.r_jup_mean*1e2)
+        
+        # --- Convert all plotted x-data from meters to micrometers ---
+        for line in ax.get_lines():
+            x = line.get_xdata()
+            line.set_xdata(x * 1e6)
+            y = line.get_ydata()
+            line.set_ydata(y/cst.r_jup_mean*1e2)
+
+        label = self.params['label']
+        if return_ax==False:
+            ax.set_xlabel(r'Wavelength [$\mathrm{\mu}$m]')
+            #ax.set_ylabel(r'Transit radius [m]')
+            ax.set_ylabel(r'Transit radius [$\rm R_{Jup}$]')
+            ax.set_title(label)
+        #else:
+            #ax.set_ylabel('')       # clears the label text
+            #ax.set_xlabel('')
+            #ax.text(0.5, 0.8, label,transform=ax.transAxes, ha='center',
+                    #va='bottom', fontsize=12#, fontweight='bold'
+                    #)
+        # --- Add right y-axis: transit depth in % ---
+        if add_transit_depth:
+            Rstar_m = self.params['R_star'].to(u.m).value   #[m]
+            #Rp_m  = self.params['planet_radius']*1e-2  # [m]
+            RJup_m = cst.r_jup_mean * 1e-2 
+
+            def Rp_to_depth(Rp_Rjup):
+                Rp_m = Rp_Rjup * RJup_m
+                return 100.0 * (Rp_m / Rstar_m)**2
+
+            def depth_to_Rp(depth_percent):
+                Rp_m = np.sqrt(depth_percent / 100.0) * Rstar_m
+                return Rp_m / RJup_m
+
+            secax = ax.secondary_yaxis(
+                'right',
+                functions=(Rp_to_depth, depth_to_Rp)
+            )
+            secax.set_ylabel("Transit depth [%]")
+
+        if wave_range_um!=[]:
+            ax.set_xlim(wave_range_um[0],wave_range_um[1]) # [m]
+        else:
+            ax.set_xlim(self.params['METIS_wave_range_um'][0],self.params['METIS_wave_range_um'][1])
+    
+        if return_ax==False: 
+            fig.tight_layout()  
+            plt.savefig(f'{self.project_path}/figures/input/opacity_contributions.pdf',dpi=200)
+            plt.close()
 
     def plot_VMRs_PT(self,species=['H2O','CH4','C2H2','C2H4','C2H6']):
 

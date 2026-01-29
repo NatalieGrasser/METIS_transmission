@@ -13,6 +13,7 @@ from astropy.io import fits
 from scopesim.utils import find_file
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter
+from utils import *
 
 class METIS:
 
@@ -35,12 +36,15 @@ class METIS:
 
         self.metis = sim.OpticalTrain(self.cmd)
         self.transit_flux_array = system_obj.transit_flux_array
+        self.n_calib = 1 # can make more calib files for master flat/dark
+        self.exptime = system_obj.exptime
 
         self.order = order
         self.output_dir = pathlib.Path(f'{self.project_path}/METIS_data/transit{n_transit+1}/order{order}')
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.figs_dir = pathlib.Path(f'{self.project_path}/figures/METIS_output/transit{n_transit+1}')
         self.figs_dir.mkdir(parents=True, exist_ok=True)
+        self.transit_num = n_transit+1
 
     def get_observations(self,plot_exp=None,delete_tmp_files=True,delete_all=True):
 
@@ -64,12 +68,12 @@ class METIS:
             if len(transit_frames)>1:
                 print('Deleting raw transit frames')
                 for file in transit_frames:
-                    if file.name != 'transit_frame_0.fits' and delete_all:
+                    if file.name != 'transit_frame_0.fits' and delete_all and self.order!=0 and self.transit_num!=1:
                         file.unlink(missing_ok=True) # delete
-            if delete_all:
+            if delete_all and self.order!=0 and self.transit_num!=1:
                 for fname in ['hdul_sky.fits', 'master_dark.fits', 'master_flat.fits']:
                     (self.output_dir / fname).unlink(missing_ok=True)
-            if delete_all:
+            if delete_all and self.order!=0 and self.transit_num!=1:
                 keep = []
             else:
                 keep = ['src_0','sky','dark','flat'] # keep for debugging/plotting
@@ -100,6 +104,7 @@ class METIS:
                 # rectified bservation already generated, no need to make new obs
                 hdul_src = fits.open(hdul_src_0) # append dummy to list, will not be used
             else:
+                self.metis["skycalc_atmosphere"].include = True
                 src = sim.Source(x=[0],y=[0],ref=[0],lam=self.planet_wl_obs_range, spectra=fl) 
                 self.metis.observe(src)
                 hdul_src = self.metis.readout(exptime=self.exptime.value)[0]
@@ -112,8 +117,14 @@ class METIS:
                 hdul_src.writeto(hdul_src_path, overwrite=True)
 
             transit_simulated_frames.append(hdul_src)
-            
+        
+        # apply automatic anti-saturation dit/ndit to further calib frames
         self.hdr = hdul_src[1].header
+        self.dit = self.hdr['DIT']
+        self.ndit = self.hdr['NDIT']
+        print('Science frame \ndit=',self.dit,'\nndit=',self.hdr["NDIT"],'\nexptime=',self.exptime)
+        self.metis.cmds["!OBS.dit"] = self.dit
+        self.metis.cmds["!OBS.ndit"] = self.ndit
 
         # dark current
         master_dark_path = pathlib.Path(f'{self.output_dir}/master_dark.fits')
@@ -121,34 +132,8 @@ class METIS:
         if master_dark_path.exists():
             master_dark_hdul = fits.open(master_dark_path)
         else:
-            n_dark = 5 
             dark_stack = []
-            for i in range(n_dark):
-                self.metis["skycalc_atmosphere"].include = False  # no atmosphere
-                self.metis.observe(sim_tp.darkness()) 
-                hdul_dark = self.metis.readout(exptime=self.exptime.value)[0]
-                dark_stack.append([hdul_dark[j].data.astype(float) for j in range(1, 5)]) # all 4 detector planes
-
-            # combine per-detector (median across exposures)
-            master_dark_per_det = [np.median([stack[i] for stack in dark_stack], axis=0) for i in range(4)]
-            
-            # build HDUList: primary + 4 detectors
-            hdrs = [hdul_dark[j].header.copy() for j in range(1, 5)]
-            master_dark_hdul = fits.HDUList([hdul_dark[0]])  # primary
-            for i in range(4):
-                master_dark_hdul.append(fits.ImageHDU(master_dark_per_det[i], header=hdrs[i], name=f"DET{i+1}.DATA"))
-
-            master_dark_hdul.writeto(master_dark_path, overwrite=True)
-
-        # dark current
-        master_dark_path = pathlib.Path(f'{self.output_dir}/master_dark.fits')
-
-        if master_dark_path.exists():
-            master_dark_hdul = fits.open(master_dark_path)
-        else:
-            n_dark = 5 
-            dark_stack = []
-            for i in range(n_dark):
+            for i in range(self.n_calib):
                 self.metis["skycalc_atmosphere"].include = False  # no atmosphere
                 self.metis.observe(sim_tp.darkness()) 
                 hdul_dark = self.metis.readout(exptime=self.exptime.value)[0]
@@ -171,9 +156,8 @@ class METIS:
         if master_flat_path.exists():
             master_flat_hdul = fits.open(master_flat_path)
         else:
-            n_flat = 5
             flat_stack = []
-            for i in range(n_flat):
+            for i in range(self.n_calib):
                 self.metis["skycalc_atmosphere"].include = False  # no atmosphere
                 self.metis.observe(sim_tp.flatlamp())
                 hdul_flat = self.metis.readout(exptime=10)[0]
@@ -239,10 +223,12 @@ class METIS:
                     print(f'Created rectified_{target}, deleting transit_frame_{int(num)}')
                     hdul_src_path.unlink(missing_ok=True)  # delete file
             return rect
-                
-        rect_sky = get_rectified('sky',hdul_sky)
-        rect_dark = get_rectified('dark',master_dark_hdul)
-        rect_flat = get_rectified('flat',master_flat_hdul)
+
+        # remove edge pixels (near-zero flux, originally accidentally 4)
+        clip_x=2  
+        sky = get_rectified('sky',hdul_sky).data.astype(float)[:, :, clip_x:-clip_x]
+        dark = get_rectified('dark',master_dark_hdul).data.astype(float)[:, :, clip_x:-clip_x]
+        flat = get_rectified('flat',master_flat_hdul).data.astype(float)[:, :, clip_x:-clip_x]
 
         rect_src_frames = []
         for i,hdul_src in enumerate(transit_simulated_frames):
@@ -257,12 +243,6 @@ class METIS:
 
         del transit_simulated_frames # memory issues
 
-        # remove edge pixels (near-zero flux)
-        clip_x = 2 
-        sky = rect_sky.data.astype(float)[:, :, clip_x:-clip_x]
-        dark = rect_dark.data.astype(float)[:, :, clip_x:-clip_x]
-        flat = rect_flat.data.astype(float)[:, :, clip_x:-clip_x]
-
         def get_wavelegth_from_header(rect, header):
             crval = float(header['CRVAL3'])
             crpix = float(header['CRPIX3'])
@@ -270,17 +250,11 @@ class METIS:
             nwave = rect.shape[0]
             wl = crval + (np.arange(1, nwave+1) - crpix) * cdelt
             return wl, nwave
-
-        def get_quantum_efficiency(metis, wave_array):
-            wave_array = np.array(wave_array)
-            qe_file_rel = metis.cmds["!DET.qe_curve"]["file_name"]
-            qe_file = find_file(qe_file_rel)
-            wl, qe = np.loadtxt(qe_file, unpack=True, comments="#",skiprows=15)
-            qe_interp = np.interp(wave_array, wl, qe)
-            return qe_interp
         
-        def estimate_variance_from_calib_data(data):
+        def estimate_variance_from_calib_data(src_dark_flat, sky_dark_flat):
 
+            # estimate background from caibrated sky
+            data = sky_dark_flat
             nwave, ny, nx = data.shape
 
             # define margins
@@ -301,24 +275,31 @@ class METIS:
             bg_std_corrected = np.where(bg_std==0, np.median(bg_std[bg_std>0]), bg_std)
             
             # broadcast to full cube
-            var_cube = np.ones_like(data) * (bg_std_corrected[:, np.newaxis, np.newaxis]**2)
+            var_bg = np.ones_like(data) * (bg_std_corrected[:, np.newaxis, np.newaxis]**2)
+
+            # photon noise from source
+            var_src = np.maximum(src_dark_flat, 0)
+
+            # readout noise ~ 70
+            read_noise = self.cmd["!DET.readout_noise"]
+
+            # dark current (~0.1 e⁻/s/pixel) * exptime per frame
+            var_dark = self.cmd["!DET.dark_current"] * self.exptime.to('s').value
+
+            # total variance
+            var_cube = var_bg + var_src + read_noise**2 + var_dark
+
+            # safety floor
+            var_cube = np.maximum(var_cube, 1e-6)
+
             return var_cube
-    
-        # remove edge pixels (near-zero flux)
-        clip_x = 2 
-        sky = rect_sky.data.astype(float)[:, :, clip_x:-clip_x]
-        dark = rect_dark.data.astype(float)[:, :, clip_x:-clip_x]
-        flat = rect_flat.data.astype(float)[:, :, clip_x:-clip_x]
 
         calib_frames = []
         var_cubes = []
-        for i,rect_src in enumerate(rect_src_frames):
+        for i,src in enumerate(rect_src_frames):
             if i==0:
-                wavelengths, nwave = get_wavelegth_from_header(rect_src, self.hdr)
-            try:
-                src = rect_src.data.astype(float)[:, :, clip_x:-clip_x]
-            except:
-                print('Corrupted:',i)
+                wavelengths, nwave = get_wavelegth_from_header(src, self.hdr)
+            src = src.data.astype(float)[:, :, clip_x:-clip_x]
             src_dark = src - dark
             sky_dark = sky - dark
             src_dark_flat =  src_dark / flat
@@ -327,10 +308,11 @@ class METIS:
 
             if plot_exp is not None:
                 if i==plot_exp:
-                    self.plot_rectified(src,dark,src_dark_flat,flat,src_minus_sky,sky_dark_flat,plot_exp)
+                    self.plot_rectified(src,dark,flat,sky,plot_exp)
+                    #self.plot_rectified_all(src,dark,src_dark_flat,flat,src_minus_sky,sky_dark_flat,plot_exp)
 
             calib_frames.append(src_minus_sky)
-            var_cube = estimate_variance_from_calib_data(src_minus_sky)[:, :, clip_x:-clip_x]
+            var_cube = estimate_variance_from_calib_data(src_dark_flat, sky_dark_flat)
             var_cubes.append(var_cube)           
 
         def find_trace_and_optimally_extract(cube, var_cube=None, wavelengths=None,
@@ -593,31 +575,31 @@ class METIS:
         return wl_obs, fluxes_obs, err_obs
 
     def plot_raw_obs(self,hdul_src,master_flat_hdul,master_dark_hdul,hdul_sky,plot_exp=''):
-        # Compare raw observations before rectification
-        x = 1
-        src_raw  = hdul_src[x].data.astype(float)
+        x = 1 # detector number (4 total)
+        # multiply science by NDIT, bc raw HDU contains only a single DIT
+        src_raw  = hdul_src[x].data.astype(float)*hdul_src[x].header["NDIT"]
         flat_raw= master_flat_hdul[x].data.astype(float)
         dark_raw= master_dark_hdul[x].data.astype(float)
         sky_raw= hdul_sky[x].data.astype(float)
 
         fig, ax = plt.subplots(2,2,figsize=(7,6))
-        im0 = ax[0,0].imshow(src_raw, vmin=0, vmax=np.percentile(src_raw, 99), aspect='auto')
+        im0 = ax[0,0].imshow(src_raw, vmin=0, vmax=np.percentile(src_raw, 99), aspect='auto', cmap=custom_cmap)
         ax[0,0].set_title("Science (raw)")
         plt.colorbar(im0,ax=ax[0,0])
-        im1 = ax[1,0].imshow(flat_raw, vmin=0,vmax=np.nanpercentile(flat_raw,99), aspect='auto')
-        ax[1,0].set_title("Flat (raw)")
+        im1 = ax[1,0].imshow(flat_raw, vmin=0,vmax=np.nanpercentile(flat_raw,99), aspect='auto', cmap=custom_cmap)
+        ax[1,0].set_title("Flat (raw, normalized)")
         plt.colorbar(im1,ax=ax[1,0])
-        im2 = ax[0,1].imshow(sky_raw, vmin=0, vmax=np.percentile(sky_raw, 99), aspect='auto')
+        im2 = ax[0,1].imshow(sky_raw, vmin=0, vmax=np.percentile(sky_raw, 99), aspect='auto', cmap=custom_cmap)
         ax[0,1].set_title("Sky (raw)")
         plt.colorbar(im2,ax=ax[0,1])
-        im3 = ax[1,1].imshow(dark_raw, vmin=0, vmax=np.percentile(dark_raw, 99), aspect='auto')
+        im3 = ax[1,1].imshow(dark_raw, vmin=0, vmax=np.percentile(dark_raw, 99), aspect='auto', cmap=custom_cmap)
         ax[1,1].set_title("Dark (raw)")
         plt.colorbar(im3,ax=ax[1,1])
         fig.tight_layout()
         fig.savefig(f'{self.figs_dir}/raw_obs_{self.order}{plot_exp}.pdf', bbox_inches='tight')
         plt.close()
 
-    def plot_rectified(self,src,dark,src_dark_flat,flat,src_minus_sky,sky_dark_flat,plot_exp):
+    def plot_rectified_all(self,src,dark,src_dark_flat,flat,src_minus_sky,sky_dark_flat,plot_exp):
         fig, ax = plt.subplots(3, 2, figsize=(7,7), sharex=True, sharey=True)
         im = ax[0,0].imshow(np.nanmedian(src, axis=0), aspect='auto')
         fig.colorbar(im, ax=ax[0,0]); ax[0,0].set_title("Science (rectified)")
@@ -631,6 +613,21 @@ class METIS:
         fig.colorbar(im, ax=ax[2,0]); ax[2,0].set_title("Source - sky (calibrated)")
         im = ax[2,1].imshow(np.nanmedian(sky_dark_flat, axis=0), aspect='auto')
         fig.colorbar(im, ax=ax[2,1]); ax[2,1].set_title("Sky (calibrated)")
+        plt.tight_layout()
+        fig.savefig(f'{self.figs_dir}/rectified_{self.order}{plot_exp}.pdf', bbox_inches='tight')
+        plt.close()
+
+    def plot_rectified(self,src,dark,flat,sky,plot_exp):
+        fig, ax = plt.subplots(2, 2, figsize=(7,5), sharex=True, sharey=True)
+        im = ax[0,0].imshow(np.nanmedian(src, axis=0), aspect='auto', cmap=custom_cmap)
+        fig.colorbar(im, ax=ax[0,0]); ax[0,0].set_title("Science (rectified)")
+        im = ax[0,1].imshow(np.nanmedian(sky, axis=0), aspect='auto', cmap=custom_cmap)
+        fig.colorbar(im, ax=ax[0,1]); ax[0,1].set_title("Sky (rectified)")
+        im = ax[1,0].imshow(np.nanmedian(flat, axis=0), aspect='auto', cmap=custom_cmap)
+        fig.colorbar(im, ax=ax[1,0]); ax[1,0].set_title("Flat (rectified)")
+        im = ax[1,1].imshow(np.nanmedian(dark, axis=0), aspect='auto', cmap=custom_cmap)
+        fig.colorbar(im, ax=ax[1,1]); ax[1,1].set_title("Dark (rectified)")
+        #plt.suptitle('Rectified observations')
         plt.tight_layout()
         fig.savefig(f'{self.figs_dir}/rectified_{self.order}{plot_exp}.pdf', bbox_inches='tight')
         plt.close()
